@@ -49,44 +49,47 @@ def clean_signal(x):
 def estimate_signal_bpm(x, fs=100):
     x = clean_signal(x)
 
-    if len(x) < 100:
-        return None
+    if len(x) < 300:
+        return None, None, 0
 
     x = np.array(x, dtype=np.float64)
 
     signal_range = np.max(x) - np.min(x)
+    signal_std = np.std(x)
 
-    if signal_range < 30:
-        return None
+    if signal_range < 50 or signal_std <= 0:
+        return None, None, 0
 
     min_distance = int(0.35 * fs)
-    prom = max(0.03 * np.std(x), 1e-6)
+    prominence = max(0.08 * signal_std, 1e-6)
 
     peaks, _ = find_peaks(
         x,
         distance=min_distance,
-        prominence=prom,
+        prominence=prominence,
     )
 
-    if len(peaks) < 2:
-        return None
+    if len(peaks) < 4:
+        return None, None, len(peaks)
 
     rr = np.diff(peaks) / fs
 
     rr = rr[
-        (rr >= 0.30) &
-        (rr <= 1.8)
+        (rr >= 0.35) &
+        (rr <= 1.5)
     ]
 
-    if len(rr) < 1:
-        return None
+    if len(rr) < 3:
+        return None, None, len(peaks)
 
     bpm = 60 / (np.mean(rr) + 1e-6)
 
-    if bpm < 35 or bpm > 200:
-        return None
+    if bpm < 45 or bpm > 170:
+        return None, None, len(peaks)
 
-    return float(bpm)
+    regularity = np.std(rr) / (np.mean(rr) + 1e-6)
+
+    return float(bpm), float(regularity), len(peaks)
 
 
 def is_valid_ppg_signal(ir, red):
@@ -118,7 +121,7 @@ def is_valid_ppg_signal(ir, red):
     if ir_std > 0 and red_std > 0:
         corr = np.corrcoef(ir, red)[0, 1]
 
-    bpm = estimate_signal_bpm(ir, FS)
+    bpm, regularity, peaks_count = estimate_signal_bpm(ir, FS)
 
     print("SIGNAL DEBUG:", {
         "ir_mean": float(ir_mean),
@@ -131,34 +134,42 @@ def is_valid_ppg_signal(ir, red):
         "red_cv": float(red_cv),
         "corr": float(corr) if np.isfinite(corr) else None,
         "bpm": bpm,
+        "regularity": regularity,
+        "peaks_count": peaks_count,
     })
 
-    # Very weak contact only.
-    # خففنا الشرط عشان الصباع الحقيقي يعدي.
-    if ir_mean < 1000 or red_mean < 100:
+    # Weak contact.
+    if ir_mean < 3000 or red_mean < 300:
         return False, "Weak finger contact"
 
-    # Extreme saturation only.
+    # Saturation / very strong reflection.
     if ir_mean > 400000 or red_mean > 400000:
         return False, "Signal saturated"
 
-    # Almost flat signal only.
-    if ir_range < 10 or red_range < 5:
+    # Almost flat signal.
+    if ir_range < 60 or red_range < 20:
         return False, "Signal is too flat"
 
-    # Zero variation only.
-    if ir_std == 0 or red_std == 0:
-        return False, "No signal variation"
+    # Very weak variation.
+    if ir_cv < 0.0002 or red_cv < 0.00005:
+        return False, "PPG variation too weak"
 
-    # دلوقتي مش هنمنع prediction بسبب BPM/correlation.
-    # بس هنطبع warning في اللوجز.
+    # IR and RED should have a reasonable relationship.
+    if not np.isfinite(corr) or corr < 0.25:
+        return False, "IR/RED signals are not correlated"
+
+    # Main rule: real finger PPG should have pulse-like peaks.
     if bpm is None:
-        print("WARNING: BPM not detected, but prediction will continue.")
+        return False, "No valid pulse detected"
 
-    if not np.isfinite(corr):
-        print("WARNING: Correlation invalid, but prediction will continue.")
+    # Reject random/unstable peaks.
+    if regularity is None or regularity > 0.55:
+        return False, "Pulse is not regular enough"
 
-    return True, "Signal accepted"
+    if peaks_count < 4:
+        return False, "Not enough pulse peaks"
+
+    return True, "Valid finger PPG signal"
 
 
 def basic_features(x):
