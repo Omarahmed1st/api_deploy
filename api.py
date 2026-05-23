@@ -56,11 +56,11 @@ def estimate_signal_bpm(x, fs=100):
 
     signal_range = np.max(x) - np.min(x)
 
-    if signal_range < 50:
+    if signal_range < 30:
         return None
 
     min_distance = int(0.35 * fs)
-    prom = max(0.05 * np.std(x), 1e-6)
+    prom = max(0.03 * np.std(x), 1e-6)
 
     peaks, _ = find_peaks(
         x,
@@ -133,33 +133,32 @@ def is_valid_ppg_signal(ir, red):
         "bpm": bpm,
     })
 
-    # Weak contact check.
-    # Relaxed عشان ما يرفضش الصباع الحقيقي.
-    if ir_mean < 5000 or red_mean < 500:
+    # Very weak contact only.
+    # خففنا الشرط عشان الصباع الحقيقي يعدي.
+    if ir_mean < 1000 or red_mean < 100:
         return False, "Weak finger contact"
 
-    # Saturation / very strong reflection.
-    if ir_mean > 300000 or red_mean > 300000:
+    # Extreme saturation only.
+    if ir_mean > 400000 or red_mean > 400000:
         return False, "Signal saturated"
 
-    # Reject almost flat signal.
-    if ir_range < 50 or red_range < 20:
+    # Almost flat signal only.
+    if ir_range < 10 or red_range < 5:
         return False, "Signal is too flat"
 
-    # Reject extremely weak variation.
-    if ir_cv < 0.0001 or red_cv < 0.0001:
-        return False, "PPG variation too weak"
+    # Zero variation only.
+    if ir_std == 0 or red_std == 0:
+        return False, "No signal variation"
 
-    # Correlation check, but relaxed.
-    if np.isfinite(corr) and corr < 0.20:
-        return False, "IR/RED signals are not correlated"
-
-    # BPM هنا مش شرط قاتل.
-    # ممكن بعض النوافذ تفشل في BPM detection ومع ذلك تكون صباع حقيقي.
+    # دلوقتي مش هنمنع prediction بسبب BPM/correlation.
+    # بس هنطبع warning في اللوجز.
     if bpm is None:
-        print("WARNING: BPM not detected, but signal passed basic checks.")
+        print("WARNING: BPM not detected, but prediction will continue.")
 
-    return True, "Valid enough PPG signal"
+    if not np.isfinite(corr):
+        print("WARNING: Correlation invalid, but prediction will continue.")
+
+    return True, "Signal accepted"
 
 
 def basic_features(x):
