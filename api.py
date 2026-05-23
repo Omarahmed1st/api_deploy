@@ -49,7 +49,7 @@ def clean_signal(x):
     return np.clip(x, lower, upper)
 
 
-def estimate_signal_bpm(x, fs=100):
+def estimate_signal_bpm(x, fs=100, prominence_ratio=0.08):
     x = clean_signal(x)
 
     if len(x) < 500:
@@ -63,14 +63,14 @@ def estimate_signal_bpm(x, fs=100):
 
     cv = signal_std / (abs(signal_mean) + 1e-6)
 
-    if signal_range < 80 or signal_std <= 0:
+    if signal_range < 50 or signal_std <= 0:
         return None, None, 0
 
-    if cv < 0.00025:
+    if cv < 0.0002:
         return None, None, 0
 
-    min_distance = int(0.40 * fs)
-    prominence = max(0.12 * signal_std, 1e-6)
+    min_distance = int(0.35 * fs)
+    prominence = max(prominence_ratio * signal_std, 1e-6)
 
     peaks, _ = find_peaks(
         x,
@@ -78,22 +78,22 @@ def estimate_signal_bpm(x, fs=100):
         prominence=prominence,
     )
 
-    if len(peaks) < 4 or len(peaks) > 16:
+    if len(peaks) < 3 or len(peaks) > 18:
         return None, None, len(peaks)
 
     rr = np.diff(peaks) / fs
 
     rr = rr[
-        (rr >= 0.40) &
-        (rr <= 1.4)
+        (rr >= 0.35) &
+        (rr <= 1.6)
     ]
 
-    if len(rr) < 3:
+    if len(rr) < 2:
         return None, None, len(peaks)
 
     bpm = 60 / (np.mean(rr) + 1e-6)
 
-    if bpm < 45 or bpm > 150:
+    if bpm < 40 or bpm > 170:
         return None, None, len(peaks)
 
     regularity = np.std(rr) / (np.mean(rr) + 1e-6)
@@ -130,8 +130,19 @@ def is_valid_ppg_signal(ir, red):
     if ir_std > 0 and red_std > 0:
         corr = np.corrcoef(ir, red)[0, 1]
 
-    ir_bpm, ir_regularity, ir_peaks = estimate_signal_bpm(ir, FS)
-    red_bpm, red_regularity, red_peaks = estimate_signal_bpm(red, FS)
+    # IR is the main pulse channel.
+    ir_bpm, ir_regularity, ir_peaks = estimate_signal_bpm(
+        ir,
+        FS,
+        prominence_ratio=0.08,
+    )
+
+    # RED is supportive, not mandatory.
+    red_bpm, red_regularity, red_peaks = estimate_signal_bpm(
+        red,
+        FS,
+        prominence_ratio=0.04,
+    )
 
     print("SIGNAL DEBUG:", {
         "ir_mean": float(ir_mean),
@@ -163,28 +174,40 @@ def is_valid_ppg_signal(ir, red):
     if ir_cv < 0.00025 or red_cv < 0.00008:
         return False, "PPG variation too weak"
 
-    if not np.isfinite(corr) or corr < 0.35:
+    if not np.isfinite(corr):
+        return False, "Invalid IR/RED correlation"
+
+    if corr < 0.45:
         return False, "IR/RED signals are not correlated"
 
-    if ir_bpm is None or red_bpm is None:
-        return False, "No valid pulse detected in both IR and RED"
+    # Main requirement: valid IR pulse.
+    if ir_bpm is None:
+        return False, "No valid IR pulse detected"
 
-    if abs(ir_bpm - red_bpm) > 15:
-        return False, "IR and RED pulse rates do not match"
-
-    # Relaxed after real finger was rejected at IR regularity ≈ 0.469
-    # and RED regularity ≈ 0.549.
-    if ir_regularity is None or ir_regularity > 0.65:
+    if ir_regularity is None or ir_regularity > 0.70:
         return False, "IR pulse is not regular enough"
 
-    if red_regularity is None or red_regularity > 0.70:
-        return False, "RED pulse is not regular enough"
+    if ir_peaks < 3:
+        return False, "Not enough IR pulse peaks"
 
-    if ir_peaks < 4 or red_peaks < 4:
-        return False, "Not enough pulse peaks"
+    if ir_peaks > 18:
+        return False, "Too many random IR peaks"
 
-    if ir_peaks > 16 or red_peaks > 16:
-        return False, "Too many random peaks"
+    # RED check:
+    # If RED bpm exists, compare it with IR.
+    # If RED bpm does not exist, accept only when IR/RED correlation is high.
+    if red_bpm is not None:
+        if abs(ir_bpm - red_bpm) > 35:
+            return False, "IR and RED pulse rates do not match"
+
+        if red_regularity is not None and red_regularity > 0.75:
+            return False, "RED pulse is not regular enough"
+    else:
+        if corr < 0.85:
+            return False, "RED pulse not detected and correlation is not high enough"
+
+        if red_peaks < 1:
+            return False, "No RED pulse activity detected"
 
     return True, "Valid finger PPG signal"
 
