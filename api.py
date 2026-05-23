@@ -39,12 +39,9 @@ def clean_signal(x):
     if len(x) == 0:
         return x
 
-    q1 = np.percentile(x, 25)
-    q3 = np.percentile(x, 75)
-    iqr = q3 - q1
-
-    lower = q1 - 3 * iqr
-    upper = q3 + 3 * iqr
+    # قصّ الـ spikes/ADC glitches زي 65535
+    lower = np.percentile(x, 1)
+    upper = np.percentile(x, 99)
 
     return np.clip(x, lower, upper)
 
@@ -114,14 +111,19 @@ def is_valid_ppg_signal(ir, red):
     if not np.all(np.isfinite(ir)) or not np.all(np.isfinite(red)):
         return False, "Signal contains invalid values"
 
+    # نستخدم نسخة raw للـ mean والـ contact level
     ir_mean = np.mean(ir)
     red_mean = np.mean(red)
 
-    ir_std = np.std(ir)
-    red_std = np.std(red)
+    # نستخدم نسخة cleaned للـ std/range/corr عشان spikes زي 65535 ما تبوظش القرار
+    ir_clean = clean_signal(ir)
+    red_clean = clean_signal(red)
 
-    ir_range = np.max(ir) - np.min(ir)
-    red_range = np.max(red) - np.min(red)
+    ir_std = np.std(ir_clean)
+    red_std = np.std(red_clean)
+
+    ir_range = np.max(ir_clean) - np.min(ir_clean)
+    red_range = np.max(red_clean) - np.min(red_clean)
 
     ir_cv = ir_std / (abs(ir_mean) + 1e-6)
     red_cv = red_std / (abs(red_mean) + 1e-6)
@@ -130,7 +132,7 @@ def is_valid_ppg_signal(ir, red):
 
     corr = 0
     if ir_std > 0 and red_std > 0:
-        corr = np.corrcoef(ir, red)[0, 1]
+        corr = np.corrcoef(ir_clean, red_clean)[0, 1]
 
     ir_bpm, ir_regularity, ir_peaks = estimate_signal_bpm(
         ir,
@@ -176,15 +178,18 @@ def is_valid_ppg_signal(ir, red):
     if not np.isfinite(corr):
         return False, "Invalid IR/RED correlation"
 
-    if corr < 0.45:
-        return False, "IR/RED signals are not correlated"
-
     strong_contact = (
         ir_mean >= 18000 and
         red_mean >= 12000 and
-        0.65 <= red_ir_ratio <= 0.95 and
-        np.isfinite(corr) and
-        corr >= 0.80
+        0.65 <= red_ir_ratio <= 0.95
+    )
+
+    pulse_match_ok = (
+        ir_bpm is not None and
+        red_bpm is not None and
+        abs(ir_bpm - red_bpm) <= 20 and
+        ir_peaks >= 3 and
+        red_peaks >= 3
     )
 
     has_pulse_evidence = (
@@ -194,6 +199,11 @@ def is_valid_ppg_signal(ir, red):
         ir_peaks >= 3 and
         red_peaks >= 3
     )
+
+    # لو correlation ضعيف بس IR و RED شايفين نفس النبض تقريبًا، نقبلها.
+    # ده بيحل حالة spike/saturation يبوظ correlation رغم إن pulse واضح.
+    if corr < 0.45 and not pulse_match_ok:
+        return False, "IR/RED signals are not correlated"
 
     # لو amplitude قليل بس باقي علامات الصباع قوية، نعدّي القراءة.
     if (ir_std < 80 or red_std < 50) and not (strong_contact and has_pulse_evidence):
