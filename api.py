@@ -56,11 +56,11 @@ def estimate_signal_bpm(x, fs=100):
 
     signal_range = np.max(x) - np.min(x)
 
-    if signal_range < 150:
+    if signal_range < 50:
         return None
 
-    min_distance = int(0.4 * fs)
-    prom = max(0.15 * np.std(x), 1e-6)
+    min_distance = int(0.35 * fs)
+    prom = max(0.05 * np.std(x), 1e-6)
 
     peaks, _ = find_peaks(
         x,
@@ -68,27 +68,22 @@ def estimate_signal_bpm(x, fs=100):
         prominence=prom,
     )
 
-    if len(peaks) < 4:
+    if len(peaks) < 2:
         return None
 
     rr = np.diff(peaks) / fs
 
     rr = rr[
-        (rr >= 0.35) &
-        (rr <= 1.5)
+        (rr >= 0.30) &
+        (rr <= 1.8)
     ]
 
-    if len(rr) < 3:
+    if len(rr) < 1:
         return None
 
     bpm = 60 / (np.mean(rr) + 1e-6)
 
-    if bpm < 45 or bpm > 160:
-        return None
-
-    regularity = np.std(rr) / (np.mean(rr) + 1e-6)
-
-    if regularity > 0.35:
+    if bpm < 35 or bpm > 200:
         return None
 
     return float(bpm)
@@ -119,32 +114,52 @@ def is_valid_ppg_signal(ir, red):
     ir_cv = ir_std / (abs(ir_mean) + 1e-6)
     red_cv = red_std / (abs(red_mean) + 1e-6)
 
-    if ir_mean < 15000 or red_mean < 5000:
-        return False, "Weak finger contact"
-
-    if ir_mean > 220000 or red_mean > 220000:
-        return False, "Signal saturated"
-
-    if ir_range < 200 or red_range < 80:
-        return False, "Signal is too flat"
-
-    if ir_cv < 0.001 or red_cv < 0.001:
-        return False, "PPG variation too weak"
-
-    if ir_std == 0 or red_std == 0:
-        return False, "No signal variation"
-
-    corr = np.corrcoef(ir, red)[0, 1]
-
-    if not np.isfinite(corr) or corr < 0.65:
-        return False, "IR/RED signals are not correlated"
+    corr = 0
+    if ir_std > 0 and red_std > 0:
+        corr = np.corrcoef(ir, red)[0, 1]
 
     bpm = estimate_signal_bpm(ir, FS)
 
-    if bpm is None:
-        return False, "No valid pulse detected"
+    print("SIGNAL DEBUG:", {
+        "ir_mean": float(ir_mean),
+        "red_mean": float(red_mean),
+        "ir_std": float(ir_std),
+        "red_std": float(red_std),
+        "ir_range": float(ir_range),
+        "red_range": float(red_range),
+        "ir_cv": float(ir_cv),
+        "red_cv": float(red_cv),
+        "corr": float(corr) if np.isfinite(corr) else None,
+        "bpm": bpm,
+    })
 
-    return True, "Valid PPG signal"
+    # Weak contact check.
+    # Relaxed عشان ما يرفضش الصباع الحقيقي.
+    if ir_mean < 5000 or red_mean < 500:
+        return False, "Weak finger contact"
+
+    # Saturation / very strong reflection.
+    if ir_mean > 300000 or red_mean > 300000:
+        return False, "Signal saturated"
+
+    # Reject almost flat signal.
+    if ir_range < 50 or red_range < 20:
+        return False, "Signal is too flat"
+
+    # Reject extremely weak variation.
+    if ir_cv < 0.0001 or red_cv < 0.0001:
+        return False, "PPG variation too weak"
+
+    # Correlation check, but relaxed.
+    if np.isfinite(corr) and corr < 0.20:
+        return False, "IR/RED signals are not correlated"
+
+    # BPM هنا مش شرط قاتل.
+    # ممكن بعض النوافذ تفشل في BPM detection ومع ذلك تكون صباع حقيقي.
+    if bpm is None:
+        print("WARNING: BPM not detected, but signal passed basic checks.")
+
+    return True, "Valid enough PPG signal"
 
 
 def basic_features(x):
