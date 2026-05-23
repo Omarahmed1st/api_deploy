@@ -167,36 +167,46 @@ def is_valid_ppg_signal(ir, red):
     # CONTACT / FINGER CHECK
     # =========================
 
-    # الصباع الحقيقي عندك بيكون تقريبًا IR 28k-30k و RED 24k-25k.
-    # نسيب margin أقل عشان الضغط الهادي يعدّي.
     if ir_mean < 15000 or red_mean < 9000:
         return False, "Object is not in proper finger contact"
 
-    # خففنا amplitude threshold عشان صباعك كان ir_std حوالي 147 واترفض.
-    if ir_std < 80 or red_std < 50:
-        return False, "Signal amplitude too weak for finger contact"
-
-    # خففنا range threshold عشان الصباع الهادي يعدّي.
-    if ir_range < 250 or red_range < 100:
-        return False, "Signal range too weak for finger contact"
-
-    # نسبة RED/IR لازم تبقى منطقية لصباع.
     if red_ir_ratio < 0.60 or red_ir_ratio > 1.05:
         return False, "Invalid RED/IR contact ratio"
-
-    # variation ضعيف جدًا = غالبًا object reflection.
-    if ir_cv < 0.002 or red_cv < 0.001:
-        return False, "PPG variation too weak"
-
-    # Saturation / very strong reflection.
-    if ir_mean > 400000 or red_mean > 400000:
-        return False, "Signal saturated"
 
     if not np.isfinite(corr):
         return False, "Invalid IR/RED correlation"
 
     if corr < 0.45:
         return False, "IR/RED signals are not correlated"
+
+    strong_contact = (
+        ir_mean >= 18000 and
+        red_mean >= 12000 and
+        0.65 <= red_ir_ratio <= 0.95 and
+        np.isfinite(corr) and
+        corr >= 0.80
+    )
+
+    has_pulse_evidence = (
+        ir_bpm is not None and
+        red_bpm is not None and
+        abs(ir_bpm - red_bpm) <= 35 and
+        ir_peaks >= 3 and
+        red_peaks >= 3
+    )
+
+    # لو amplitude قليل بس باقي علامات الصباع قوية، نعدّي القراءة.
+    if (ir_std < 80 or red_std < 50) and not (strong_contact and has_pulse_evidence):
+        return False, "Signal amplitude too weak for finger contact"
+
+    if (ir_range < 250 or red_range < 100) and not (strong_contact and has_pulse_evidence):
+        return False, "Signal range too weak for finger contact"
+
+    if (ir_cv < 0.002 or red_cv < 0.001) and not (strong_contact and has_pulse_evidence):
+        return False, "PPG variation too weak"
+
+    if ir_mean > 400000 or red_mean > 400000:
+        return False, "Signal saturated"
 
     # Main requirement: valid IR pulse.
     if ir_bpm is None:
@@ -211,9 +221,7 @@ def is_valid_ppg_signal(ir, red):
     if ir_peaks > 18:
         return False, "Too many random IR peaks"
 
-    # RED check:
-    # If RED bpm exists, compare it with IR.
-    # If RED bpm does not exist, accept only when IR/RED correlation is high.
+    # RED supportive check.
     if red_bpm is not None:
         if abs(ir_bpm - red_bpm) > 35:
             return False, "IR and RED pulse rates do not match"
