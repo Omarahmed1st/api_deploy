@@ -11,8 +11,8 @@ app = Flask(__name__)
 
 FS = 100
 
-model = joblib.load("../models/glucose_model.pkl")
-features_order = joblib.load("../models/model_features.pkl")
+model = joblib.load("models/glucose_model.pkl")
+features_order = joblib.load("models/model_features.pkl")
 
 print("MODEL LOADED SUCCESSFULLY")
 print("Number of model features:", len(features_order))
