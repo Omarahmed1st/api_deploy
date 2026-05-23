@@ -126,6 +126,8 @@ def is_valid_ppg_signal(ir, red):
     ir_cv = ir_std / (abs(ir_mean) + 1e-6)
     red_cv = red_std / (abs(red_mean) + 1e-6)
 
+    red_ir_ratio = red_mean / (ir_mean + 1e-6)
+
     corr = 0
     if ir_std > 0 and red_std > 0:
         corr = np.corrcoef(ir, red)[0, 1]
@@ -153,6 +155,7 @@ def is_valid_ppg_signal(ir, red):
         "red_range": float(red_range),
         "ir_cv": float(ir_cv),
         "red_cv": float(red_cv),
+        "red_ir_ratio": float(red_ir_ratio),
         "corr": float(corr) if np.isfinite(corr) else None,
         "ir_bpm": ir_bpm,
         "red_bpm": red_bpm,
@@ -162,17 +165,34 @@ def is_valid_ppg_signal(ir, red):
         "red_peaks": red_peaks,
     })
 
-    if ir_mean < 3000 or red_mean < 300:
-        return False, "Weak finger contact"
+    # =========================
+    # CONTACT / FINGER CHECK
+    # =========================
 
+    # لو الجسم بعيد سنة، غالبًا reflected DC level هيبقى أقل من الصباع الحقيقي.
+    # الصباع الحقيقي عندك كان تقريبًا IR 28k-30k و RED 24k-25k.
+    if ir_mean < 18000 or red_mean < 12000:
+        return False, "Object is not in proper finger contact"
+
+    # لو الإشارة ضعيفة جدًا حتى لو فيها pseudo-peaks، غالبًا reflection مش صباع.
+    if ir_std < 250 or red_std < 120:
+        return False, "Signal amplitude too weak for finger contact"
+
+    # لازم range يبقى قوي كفاية، مش مجرد noise صغير.
+    if ir_range < 800 or red_range < 300:
+        return False, "Signal range too weak for finger contact"
+
+    # نسبة RED/IR لازم تبقى منطقية لصباع.
+    if red_ir_ratio < 0.60 or red_ir_ratio > 1.05:
+        return False, "Invalid RED/IR contact ratio"
+
+    # variation ضعيف جدًا = غالبًا object reflection.
+    if ir_cv < 0.003 or red_cv < 0.0015:
+        return False, "PPG variation too weak"
+
+    # Saturation / very strong reflection.
     if ir_mean > 400000 or red_mean > 400000:
         return False, "Signal saturated"
-
-    if ir_range < 80 or red_range < 30:
-        return False, "Signal is too flat"
-
-    if ir_cv < 0.00025 or red_cv < 0.00008:
-        return False, "PPG variation too weak"
 
     if not np.isfinite(corr):
         return False, "Invalid IR/RED correlation"
