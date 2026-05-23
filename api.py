@@ -78,7 +78,6 @@ def estimate_signal_bpm(x, fs=100):
         prominence=prominence,
     )
 
-    # In a 6-second window, normal pulse-like peaks should be roughly 4 to 16.
     if len(peaks) < 4 or len(peaks) > 16:
         return None, None, len(peaks)
 
@@ -152,42 +151,35 @@ def is_valid_ppg_signal(ir, red):
         "red_peaks": red_peaks,
     })
 
-    # Weak contact.
     if ir_mean < 3000 or red_mean < 300:
         return False, "Weak finger contact"
 
-    # Saturation / very strong reflection.
     if ir_mean > 400000 or red_mean > 400000:
         return False, "Signal saturated"
 
-    # Almost flat signal.
     if ir_range < 80 or red_range < 30:
         return False, "Signal is too flat"
 
-    # Very weak variation.
     if ir_cv < 0.00025 or red_cv < 0.00008:
         return False, "PPG variation too weak"
 
-    # IR and RED should have a reasonable relationship.
     if not np.isfinite(corr) or corr < 0.35:
         return False, "IR/RED signals are not correlated"
 
-    # Main rule: real finger PPG should have valid pulse in both IR and RED.
     if ir_bpm is None or red_bpm is None:
         return False, "No valid pulse detected in both IR and RED"
 
-    # IR and RED pulse rates should be close.
     if abs(ir_bpm - red_bpm) > 15:
         return False, "IR and RED pulse rates do not match"
 
-    # Pulse regularity check.
-    if ir_regularity is None or ir_regularity > 0.45:
+    # Relaxed after real finger was rejected at IR regularity ≈ 0.469
+    # and RED regularity ≈ 0.549.
+    if ir_regularity is None or ir_regularity > 0.65:
         return False, "IR pulse is not regular enough"
 
-    if red_regularity is None or red_regularity > 0.55:
+    if red_regularity is None or red_regularity > 0.70:
         return False, "RED pulse is not regular enough"
 
-    # Logical number of peaks in 6 seconds.
     if ir_peaks < 4 or red_peaks < 4:
         return False, "Not enough pulse peaks"
 
