@@ -9,38 +9,21 @@ from scipy.stats import skew, kurtosis
 
 app = Flask(__name__)
 
-# ======================================
-# CONFIG
-# ======================================
-
 FS = 100
 
-# ======================================
-# LOAD MODEL
-# ======================================
-
-model = joblib.load("models/glucose_model.pkl")
-features_order = joblib.load("models/model_features.pkl")
+model = joblib.load("../models/glucose_model.pkl")
+features_order = joblib.load("../models/model_features.pkl")
 
 print("MODEL LOADED SUCCESSFULLY")
 print("Number of model features:", len(features_order))
 
 
-# ======================================
-# HOME ROUTE
-# ======================================
-
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status": "API RUNNING",
-        "model_features": len(features_order)
+        "status": "API RUNNING"
     })
 
-
-# ======================================
-# HELPERS
-# ======================================
 
 def safe_div(a, b):
     return float(a / (b + 1e-6))
@@ -63,9 +46,106 @@ def clean_signal(x):
     return np.clip(x, lower, upper)
 
 
-# ======================================
-# BASIC FEATURES
-# ======================================
+def estimate_signal_bpm(x, fs=100):
+    x = clean_signal(x)
+
+    if len(x) < 100:
+        return None
+
+    x = np.array(x, dtype=np.float64)
+
+    signal_range = np.max(x) - np.min(x)
+
+    if signal_range < 150:
+        return None
+
+    min_distance = int(0.4 * fs)
+    prom = max(0.15 * np.std(x), 1e-6)
+
+    peaks, _ = find_peaks(
+        x,
+        distance=min_distance,
+        prominence=prom,
+    )
+
+    if len(peaks) < 4:
+        return None
+
+    rr = np.diff(peaks) / fs
+
+    rr = rr[
+        (rr >= 0.35) &
+        (rr <= 1.5)
+    ]
+
+    if len(rr) < 3:
+        return None
+
+    bpm = 60 / (np.mean(rr) + 1e-6)
+
+    if bpm < 45 or bpm > 160:
+        return None
+
+    regularity = np.std(rr) / (np.mean(rr) + 1e-6)
+
+    if regularity > 0.35:
+        return None
+
+    return float(bpm)
+
+
+def is_valid_ppg_signal(ir, red):
+    ir = np.array(ir, dtype=np.float64)
+    red = np.array(red, dtype=np.float64)
+
+    if len(ir) < 600 or len(red) < 600:
+        return False, "Need at least 600 samples"
+
+    if len(ir) != len(red):
+        return False, "IR and RED length mismatch"
+
+    if not np.all(np.isfinite(ir)) or not np.all(np.isfinite(red)):
+        return False, "Signal contains invalid values"
+
+    ir_mean = np.mean(ir)
+    red_mean = np.mean(red)
+
+    ir_std = np.std(ir)
+    red_std = np.std(red)
+
+    ir_range = np.max(ir) - np.min(ir)
+    red_range = np.max(red) - np.min(red)
+
+    ir_cv = ir_std / (abs(ir_mean) + 1e-6)
+    red_cv = red_std / (abs(red_mean) + 1e-6)
+
+    if ir_mean < 15000 or red_mean < 5000:
+        return False, "Weak finger contact"
+
+    if ir_mean > 220000 or red_mean > 220000:
+        return False, "Signal saturated"
+
+    if ir_range < 200 or red_range < 80:
+        return False, "Signal is too flat"
+
+    if ir_cv < 0.001 or red_cv < 0.001:
+        return False, "PPG variation too weak"
+
+    if ir_std == 0 or red_std == 0:
+        return False, "No signal variation"
+
+    corr = np.corrcoef(ir, red)[0, 1]
+
+    if not np.isfinite(corr) or corr < 0.65:
+        return False, "IR/RED signals are not correlated"
+
+    bpm = estimate_signal_bpm(ir, FS)
+
+    if bpm is None:
+        return False, "No valid pulse detected"
+
+    return True, "Valid PPG signal"
+
 
 def basic_features(x):
     x = clean_signal(x)
@@ -101,7 +181,6 @@ def basic_features(x):
 
     mean = np.mean(x)
     std = np.std(x)
-
     mn = np.min(x)
     mx = np.max(x)
     ptp = mx - mn
@@ -129,39 +208,20 @@ def basic_features(x):
         "iqr": float(p75 - p25),
         "rms": float(np.sqrt(np.mean(x ** 2))),
         "energy": float(np.mean(x ** 2)),
-
         "skew": float(skew(x)) if len(x) > 2 and std > 0 else 0,
         "kurtosis": float(kurtosis(x)) if len(x) > 3 and std > 0 else 0,
-
         "ac_dc": safe_div(ptp, mean),
         "cv": safe_div(std, mean),
         "slope": float(slope),
-
-        "slope_energy": float(
-            np.mean(dx * dx)
-        ) if len(dx) > 0 else 0,
-
-        "mean_abs_diff": float(
-            np.mean(np.abs(dx))
-        ) if len(dx) > 0 else 0,
-
-        "diff_mean": float(
-            np.mean(dx)
-        ) if len(dx) > 0 else 0,
-
-        "diff_std": float(
-            np.std(dx)
-        ) if len(dx) > 0 else 0,
-
+        "slope_energy": float(np.mean(dx * dx)) if len(dx) > 0 else 0,
+        "mean_abs_diff": float(np.mean(np.abs(dx))) if len(dx) > 0 else 0,
+        "diff_mean": float(np.mean(dx)) if len(dx) > 0 else 0,
+        "diff_std": float(np.std(dx)) if len(dx) > 0 else 0,
         "zero_crossings": float(
             np.sum(np.diff(np.sign(centered)) != 0)
         ) if len(centered) > 1 else 0,
     }
 
-
-# ======================================
-# PEAK FEATURES
-# ======================================
 
 def peak_features(x, fs):
     x = clean_signal(x)
@@ -216,10 +276,6 @@ def peak_features(x, fs):
         "peak_rate": safe_div(len(peaks), len(x)),
     }
 
-
-# ======================================
-# FFT FEATURES
-# ======================================
 
 def frequency_features(x, fs):
     x = clean_signal(x)
@@ -283,10 +339,6 @@ def frequency_features(x, fs):
     }
 
 
-# ======================================
-# RELATION FEATURES
-# ======================================
-
 def relation_features(ir_w, red_w):
     ir_w = clean_signal(ir_w)
     red_w = clean_signal(red_w)
@@ -349,10 +401,6 @@ def relation_features(ir_w, red_w):
     }
 
 
-# ======================================
-# FULL FEATURE EXTRACTION
-# ======================================
-
 def extract_features(ir, red):
     ir = np.array(ir, dtype=np.float64)
     red = np.array(red, dtype=np.float64)
@@ -397,39 +445,38 @@ def extract_features(ir, red):
     return features
 
 
-# ======================================
-# PREDICT ROUTE
-# ======================================
-
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
         data = request.get_json(force=True)
 
         if data is None:
-            return jsonify({
-                "error": "No JSON received"
-            }), 400
+            return jsonify({"error": "No JSON received"}), 400
 
         ir = data.get("ir")
         red = data.get("red")
 
         if ir is None or red is None:
-            return jsonify({
-                "error": "Missing ir or red"
-            }), 400
+            return jsonify({"error": "Missing ir or red"}), 400
 
         if len(ir) == 0 or len(red) == 0:
-            return jsonify({
-                "error": "Empty ir or red arrays"
-            }), 400
+            return jsonify({"error": "Empty ir or red arrays"}), 400
 
         if len(ir) != len(red):
-            return jsonify({
-                "error": "ir and red length mismatch"
-            }), 400
+            return jsonify({"error": "ir and red length mismatch"}), 400
 
         print(f"Received samples: IR={len(ir)}, RED={len(red)}")
+
+        valid_signal, reason = is_valid_ppg_signal(ir, red)
+
+        if not valid_signal:
+            print("INVALID SIGNAL:", reason)
+            return jsonify({
+                "error": "Invalid finger PPG signal",
+                "reason": reason
+            }), 422
+
+        print("VALID SIGNAL:", reason)
 
         features = extract_features(ir, red)
 
@@ -460,15 +507,8 @@ def predict():
 
     except Exception as e:
         print("ERROR:", e)
+        return jsonify({"error": str(e)}), 500
 
-        return jsonify({
-            "error": str(e)
-        }), 500
-
-
-# ======================================
-# RUN LOCAL ONLY
-# ======================================
 
 if __name__ == "__main__":
     app.run(
