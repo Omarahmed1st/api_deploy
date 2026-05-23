@@ -132,14 +132,12 @@ def is_valid_ppg_signal(ir, red):
     if ir_std > 0 and red_std > 0:
         corr = np.corrcoef(ir, red)[0, 1]
 
-    # IR is the main pulse channel.
     ir_bpm, ir_regularity, ir_peaks = estimate_signal_bpm(
         ir,
         FS,
         prominence_ratio=0.08,
     )
 
-    # RED is supportive, not mandatory.
     red_bpm, red_regularity, red_peaks = estimate_signal_bpm(
         red,
         FS,
@@ -169,17 +167,17 @@ def is_valid_ppg_signal(ir, red):
     # CONTACT / FINGER CHECK
     # =========================
 
-    # لو الجسم بعيد سنة، غالبًا reflected DC level هيبقى أقل من الصباع الحقيقي.
-    # الصباع الحقيقي عندك كان تقريبًا IR 28k-30k و RED 24k-25k.
-    if ir_mean < 18000 or red_mean < 12000:
+    # الصباع الحقيقي عندك بيكون تقريبًا IR 28k-30k و RED 24k-25k.
+    # نسيب margin أقل عشان الضغط الهادي يعدّي.
+    if ir_mean < 15000 or red_mean < 9000:
         return False, "Object is not in proper finger contact"
 
-    # لو الإشارة ضعيفة جدًا حتى لو فيها pseudo-peaks، غالبًا reflection مش صباع.
-    if ir_std < 250 or red_std < 120:
+    # خففنا amplitude threshold عشان صباعك كان ir_std حوالي 147 واترفض.
+    if ir_std < 80 or red_std < 50:
         return False, "Signal amplitude too weak for finger contact"
 
-    # لازم range يبقى قوي كفاية، مش مجرد noise صغير.
-    if ir_range < 800 or red_range < 300:
+    # خففنا range threshold عشان الصباع الهادي يعدّي.
+    if ir_range < 250 or red_range < 100:
         return False, "Signal range too weak for finger contact"
 
     # نسبة RED/IR لازم تبقى منطقية لصباع.
@@ -187,7 +185,7 @@ def is_valid_ppg_signal(ir, red):
         return False, "Invalid RED/IR contact ratio"
 
     # variation ضعيف جدًا = غالبًا object reflection.
-    if ir_cv < 0.003 or red_cv < 0.0015:
+    if ir_cv < 0.002 or red_cv < 0.001:
         return False, "PPG variation too weak"
 
     # Saturation / very strong reflection.
