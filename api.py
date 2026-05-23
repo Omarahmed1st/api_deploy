@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import joblib
@@ -11,8 +12,10 @@ app = Flask(__name__)
 
 FS = 100
 
-model = joblib.load("models/glucose_model.pkl")
-features_order = joblib.load("models/model_features.pkl")
+BASE_DIR = Path(__file__).resolve().parent
+
+model = joblib.load(BASE_DIR / "models" / "glucose_model.pkl")
+features_order = joblib.load(BASE_DIR / "models" / "model_features.pkl")
 
 print("MODEL LOADED SUCCESSFULLY")
 print("Number of model features:", len(features_order))
@@ -138,31 +141,24 @@ def is_valid_ppg_signal(ir, red):
         "peaks_count": peaks_count,
     })
 
-    # Weak contact.
     if ir_mean < 3000 or red_mean < 300:
         return False, "Weak finger contact"
 
-    # Saturation / very strong reflection.
     if ir_mean > 400000 or red_mean > 400000:
         return False, "Signal saturated"
 
-    # Almost flat signal.
     if ir_range < 60 or red_range < 20:
         return False, "Signal is too flat"
 
-    # Very weak variation.
     if ir_cv < 0.0002 or red_cv < 0.00005:
         return False, "PPG variation too weak"
 
-    # IR and RED should have a reasonable relationship.
     if not np.isfinite(corr) or corr < 0.25:
         return False, "IR/RED signals are not correlated"
 
-    # Main rule: real finger PPG should have pulse-like peaks.
     if bpm is None:
         return False, "No valid pulse detected"
 
-    # Reject random/unstable peaks.
     if regularity is None or regularity > 0.55:
         return False, "Pulse is not regular enough"
 
