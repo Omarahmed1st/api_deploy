@@ -20,6 +20,10 @@ features_order = joblib.load(BASE_DIR / "models" / "model_features.pkl")
 print("MODEL LOADED SUCCESSFULLY")
 print("Number of model features:", len(features_order))
 
+prediction_history = []
+MAX_HISTORY = 5
+MAX_JUMP = 12
+
 
 @app.route("/", methods=["GET"])
 def home():
@@ -39,7 +43,6 @@ def clean_signal(x):
     if len(x) == 0:
         return x
 
-    # قصّ الـ spikes/ADC glitches زي 65535
     lower = np.percentile(x, 1)
     upper = np.percentile(x, 99)
 
@@ -111,11 +114,9 @@ def is_valid_ppg_signal(ir, red):
     if not np.all(np.isfinite(ir)) or not np.all(np.isfinite(red)):
         return False, "Signal contains invalid values"
 
-    # نستخدم نسخة raw للـ mean والـ contact level
     ir_mean = np.mean(ir)
     red_mean = np.mean(red)
 
-    # نستخدم نسخة cleaned للـ std/range/corr عشان spikes زي 65535 ما تبوظش القرار
     ir_clean = clean_signal(ir)
     red_clean = clean_signal(red)
 
@@ -165,10 +166,6 @@ def is_valid_ppg_signal(ir, red):
         "red_peaks": red_peaks,
     })
 
-    # =========================
-    # CONTACT / FINGER CHECK
-    # =========================
-
     if ir_mean < 15000 or red_mean < 9000:
         return False, "Object is not in proper finger contact"
 
@@ -200,12 +197,9 @@ def is_valid_ppg_signal(ir, red):
         red_peaks >= 3
     )
 
-    # لو correlation ضعيف بس IR و RED شايفين نفس النبض تقريبًا، نقبلها.
-    # ده بيحل حالة spike/saturation يبوظ correlation رغم إن pulse واضح.
     if corr < 0.45 and not pulse_match_ok:
         return False, "IR/RED signals are not correlated"
 
-    # لو amplitude قليل بس باقي علامات الصباع قوية، نعدّي القراءة.
     if (ir_std < 80 or red_std < 50) and not (strong_contact and has_pulse_evidence):
         return False, "Signal amplitude too weak for finger contact"
 
@@ -218,7 +212,6 @@ def is_valid_ppg_signal(ir, red):
     if ir_mean > 400000 or red_mean > 400000:
         return False, "Signal saturated"
 
-    # Main requirement: valid IR pulse.
     if ir_bpm is None:
         return False, "No valid IR pulse detected"
 
@@ -231,7 +224,6 @@ def is_valid_ppg_signal(ir, red):
     if ir_peaks > 18:
         return False, "Too many random IR peaks"
 
-    # RED supportive check.
     if red_bpm is not None:
         if abs(ir_bpm - red_bpm) > 35:
             return False, "IR and RED pulse rates do not match"
@@ -598,12 +590,34 @@ def predict():
         X = X.replace([np.inf, -np.inf], 0)
         X = X.fillna(0)
 
-        pred = model.predict(X)[0]
+        raw_pred = float(model.predict(X)[0])
 
-        print("PREDICTED:", pred)
+        raw_pred = max(70, min(raw_pred, 180))
+
+        global prediction_history
+
+        if len(prediction_history) > 0:
+            last_pred = prediction_history[-1]
+
+            if abs(raw_pred - last_pred) > MAX_JUMP:
+                if raw_pred > last_pred:
+                    raw_pred = last_pred + MAX_JUMP
+                else:
+                    raw_pred = last_pred - MAX_JUMP
+
+        prediction_history.append(raw_pred)
+
+        if len(prediction_history) > MAX_HISTORY:
+            prediction_history.pop(0)
+
+        smoothed_pred = float(np.mean(prediction_history))
+
+        print("RAW PREDICTED:", raw_pred)
+        print("SMOOTHED PREDICTED:", smoothed_pred)
 
         return jsonify({
-            "predicted_glucose": round(float(pred), 1)
+            "predicted_glucose": round(smoothed_pred, 1),
+            "raw_glucose": round(raw_pred, 1)
         }), 200
 
     except Exception as e:
