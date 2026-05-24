@@ -20,9 +20,11 @@ features_order = joblib.load(BASE_DIR / "models" / "model_features.pkl")
 print("MODEL LOADED SUCCESSFULLY")
 print("Number of model features:", len(features_order))
 
+# =========================
+# ADAPTIVE SMOOTHING
+# =========================
 prediction_history = []
 MAX_HISTORY = 5
-MAX_JUMP = 12
 
 
 @app.route("/", methods=["GET"])
@@ -590,34 +592,57 @@ def predict():
         X = X.replace([np.inf, -np.inf], 0)
         X = X.fillna(0)
 
+        # =========================
+        # RAW MODEL PREDICTION
+        # =========================
         raw_pred = float(model.predict(X)[0])
 
-        raw_pred = max(70, min(raw_pred, 180))
+        # Wide realistic range
+        raw_pred = max(50, min(raw_pred, 350))
 
         global prediction_history
 
-        if len(prediction_history) > 0:
-            last_pred = prediction_history[-1]
+        # =========================
+        # ADAPTIVE SMOOTHING
+        # =========================
+        if len(prediction_history) == 0:
+            final_pred = raw_pred
+        else:
+            last_smoothed = float(np.mean(prediction_history))
+            diff = abs(raw_pred - last_smoothed)
 
-            if abs(raw_pred - last_pred) > MAX_JUMP:
-                if raw_pred > last_pred:
-                    raw_pred = last_pred + MAX_JUMP
-                else:
-                    raw_pred = last_pred - MAX_JUMP
+            if diff > 40:
+                # Big real jump -> allow it
+                final_pred = raw_pred
+                prediction_history = [raw_pred]
 
-        prediction_history.append(raw_pred)
+            elif diff > 20:
+                # Medium jump -> light smoothing
+                final_pred = (
+                    0.70 * raw_pred
+                ) + (
+                    0.30 * last_smoothed
+                )
+
+            else:
+                # Small normal fluctuation
+                final_pred = (
+                    0.45 * raw_pred
+                ) + (
+                    0.55 * last_smoothed
+                )
+
+        prediction_history.append(final_pred)
 
         if len(prediction_history) > MAX_HISTORY:
             prediction_history.pop(0)
 
-        smoothed_pred = float(np.mean(prediction_history))
-
         print("RAW PREDICTED:", raw_pred)
-        print("SMOOTHED PREDICTED:", smoothed_pred)
+        print("FINAL PREDICTED:", final_pred)
 
         return jsonify({
-            "predicted_glucose": round(smoothed_pred, 1),
-            "raw_glucose": round(raw_pred, 1)
+            "predicted_glucose": round(float(final_pred), 1),
+            "raw_glucose": round(float(raw_pred), 1)
         }), 200
 
     except Exception as e:
