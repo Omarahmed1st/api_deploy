@@ -35,17 +35,15 @@ non_diabetic_model = joblib.load(MODELS_DIR / "non_diabetic_glucose_model.pkl")
 diabetic_model = joblib.load(MODELS_DIR / "diabetic_glucose_model.pkl")
 features_order = joblib.load(MODELS_DIR / "two_group_model_features.pkl")
 
-print("TWO-GROUP MODELS LOADED SUCCESSFULLY")
-print("Number of model features:", len(features_order))
-print("Models dir:", MODELS_DIR)
+print("TWO-GROUP MODELS LOADED SUCCESSFULLY", flush=True)
+print("Number of model features:", len(features_order), flush=True)
+print("Models dir:", MODELS_DIR, flush=True)
 
 
 # =========================
-# ADAPTIVE SMOOTHING
+# SMOOTHING
 # =========================
-# During testing, keep smoothing disabled to see raw model behavior clearly.
-# Later, you can set USE_SMOOTHING = True.
-
+# Keep False during testing so prediction = raw model output.
 USE_SMOOTHING = False
 
 prediction_history = []
@@ -57,7 +55,8 @@ def home():
     return jsonify({
         "status": "API RUNNING",
         "model_type": "two_group_patient_level_model",
-        "features": len(features_order)
+        "features": len(features_order),
+        "smoothing": USE_SMOOTHING
     })
 
 
@@ -201,7 +200,7 @@ def is_valid_ppg_signal(ir, red):
         "red_regularity": red_regularity,
         "ir_peaks": ir_peaks,
         "red_peaks": red_peaks,
-    })
+    }, flush=True)
 
     if ir_mean < 15000 or red_mean < 9000:
         return False, "Object is not in proper finger contact"
@@ -699,27 +698,9 @@ def classify_glucose_range(glucose):
 
 def get_confidence_and_warning(diabetic, predicted_glucose, fasting, meal_time_hr):
     if diabetic == 0:
-        if fasting == 0 and meal_time_hr <= 1.5:
-            return (
-                "medium",
-                "Post-meal non-diabetic estimate. Experimental result; confirm if symptoms exist."
-            )
-
-        if predicted_glucose < 70 or predicted_glucose > 160:
-            return (
-                "medium",
-                "Non-diabetic estimate outside usual range. Repeat measurement or confirm if symptoms exist."
-            )
-
         return (
             "medium",
             "Experimental non-invasive estimate. Not a replacement for glucometer."
-        )
-
-    if predicted_glucose >= 180:
-        return (
-            "low",
-            "Diabetic/high-glucose estimate has higher uncertainty. Confirm with glucometer."
         )
 
     return (
@@ -729,23 +710,10 @@ def get_confidence_and_warning(diabetic, predicted_glucose, fasting, meal_time_h
 
 
 def apply_post_meal_correction(raw_pred, diabetic, fasting, meal_time_hr):
-    correction_applied = False
-    correction_reason = None
-
-    if diabetic == 0 and fasting == 0:
-        if meal_time_hr <= 1.5:
-            if raw_pred < 120:
-                raw_pred = 120
-                correction_applied = True
-                correction_reason = "non_diabetic_recent_meal_floor_120"
-
-        elif meal_time_hr <= 3:
-            if raw_pred < 110:
-                raw_pred = 110
-                correction_applied = True
-                correction_reason = "non_diabetic_post_meal_floor_110"
-
-    return raw_pred, correction_applied, correction_reason
+    # No forced correction.
+    # Meal information is used as a model input feature only.
+    # This prevents fixed outputs like 120.
+    return raw_pred, False, None
 
 
 # =========================
@@ -772,7 +740,6 @@ def predict():
         if len(ir) != len(red):
             return jsonify({"error": "ir and red length mismatch"}), 400
 
-        # Metadata from Flutter
         age = float(data.get("age", 25))
         gender = float(data.get("gender", 0))
         diabetic = int(data.get("diabetic", 0))
@@ -786,7 +753,10 @@ def predict():
         if fasting not in [0, 1]:
             return jsonify({"error": "fasting must be 0 or 1"}), 400
 
-        print(f"Received samples: IR={len(ir)}, RED={len(red)}, diabetic={diabetic}")
+        if fasting == 1:
+            meal_time_hr = 0.0
+
+        print(f"Received samples: IR={len(ir)}, RED={len(red)}, diabetic={diabetic}", flush=True)
 
         print("INCOMING METADATA:", {
             "age": age,
@@ -795,23 +765,21 @@ def predict():
             "fasting": fasting,
             "meal_time_hr": meal_time_hr,
             "motion_artifact": motion_artifact,
-        })
+        }, flush=True)
 
         valid_signal, reason = is_valid_ppg_signal(ir, red)
 
         if not valid_signal:
-            print("INVALID SIGNAL:", reason)
+            print("INVALID SIGNAL:", reason, flush=True)
             return jsonify({
                 "error": "Invalid finger PPG signal",
                 "reason": reason
             }), 422
 
-        print("VALID SIGNAL:", reason)
+        print("VALID SIGNAL:", reason, flush=True)
 
-        # Patient-level features
         features = build_patient_features(ir, red)
 
-        # Add metadata
         features["age"] = age
         features["gender"] = gender
         features["diabetic"] = diabetic
@@ -819,7 +787,6 @@ def predict():
         features["meal_time_hr"] = meal_time_hr
         features["motion_artifact"] = motion_artifact
 
-        # Add quality feature defaults
         features = add_quality_defaults(features)
 
         X = pd.DataFrame([features])
@@ -832,7 +799,6 @@ def predict():
         X = X.replace([np.inf, -np.inf], 0)
         X = X.fillna(0)
 
-        # Select model
         if diabetic == 0:
             selected_model = non_diabetic_model
             model_used = "non_diabetic_model"
@@ -840,10 +806,8 @@ def predict():
             selected_model = diabetic_model
             model_used = "diabetic_model"
 
-        # Raw model prediction
         raw_model_pred = float(selected_model.predict(X)[0])
 
-        # Apply post-meal correction
         corrected_pred, correction_applied, correction_reason = apply_post_meal_correction(
             raw_model_pred,
             diabetic,
@@ -851,7 +815,6 @@ def predict():
             meal_time_hr,
         )
 
-        # Clamp by model group
         if diabetic == 0:
             corrected_pred = max(50, min(corrected_pred, 180))
         else:
@@ -893,12 +856,12 @@ def predict():
             meal_time_hr,
         )
 
-        print("MODEL USED:", model_used)
-        print("RAW MODEL PREDICTED:", raw_model_pred)
-        print("CORRECTED PREDICTED:", corrected_pred)
-        print("FINAL PREDICTED:", final_pred)
-        print("CORRECTION APPLIED:", correction_applied, correction_reason)
-        print("RANGE:", glucose_range)
+        print("MODEL USED:", model_used, flush=True)
+        print("RAW MODEL PREDICTED:", raw_model_pred, flush=True)
+        print("CORRECTED PREDICTED:", corrected_pred, flush=True)
+        print("FINAL PREDICTED:", final_pred, flush=True)
+        print("CORRECTION APPLIED:", correction_applied, correction_reason, flush=True)
+        print("RANGE:", glucose_range, flush=True)
 
         return jsonify({
             "predicted_glucose": round(float(final_pred), 1),
@@ -912,6 +875,7 @@ def predict():
             "num_windows": int(features.get("num_windows", 1)),
             "correction_applied": correction_applied,
             "correction_reason": correction_reason,
+            "smoothing_used": USE_SMOOTHING,
             "metadata_received": {
                 "age": age,
                 "gender": gender,
@@ -923,7 +887,7 @@ def predict():
         }), 200
 
     except Exception as e:
-        print("ERROR:", e)
+        print("ERROR:", e, flush=True)
         return jsonify({"error": str(e)}), 500
 
 
