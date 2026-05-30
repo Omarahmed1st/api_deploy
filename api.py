@@ -11,18 +11,31 @@ from scipy.stats import skew, kurtosis
 app = Flask(__name__)
 
 FS = 100
+WINDOW_SIZE_SEC = 6
+STEP_SIZE_SEC = 0.5
+
+WINDOW_SIZE = int(WINDOW_SIZE_SEC * FS)
+STEP_SIZE = int(STEP_SIZE_SEC * FS)
 
 BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
 
-model = joblib.load(BASE_DIR / "models" / "glucose_model.pkl")
-features_order = joblib.load(BASE_DIR / "models" / "model_features.pkl")
+# =========================
+# LOAD TWO MODELS
+# =========================
 
-print("MODEL LOADED SUCCESSFULLY")
+non_diabetic_model = joblib.load(MODELS_DIR / "non_diabetic_glucose_model.pkl")
+diabetic_model = joblib.load(MODELS_DIR / "diabetic_glucose_model.pkl")
+features_order = joblib.load(MODELS_DIR / "two_group_model_features.pkl")
+
+print("TWO-GROUP MODELS LOADED SUCCESSFULLY")
 print("Number of model features:", len(features_order))
+print("Models dir:", MODELS_DIR)
 
 # =========================
 # ADAPTIVE SMOOTHING
 # =========================
+
 prediction_history = []
 MAX_HISTORY = 5
 
@@ -30,9 +43,15 @@ MAX_HISTORY = 5
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status": "API RUNNING"
+        "status": "API RUNNING",
+        "model_type": "two_group_patient_level_model",
+        "features": len(features_order)
     })
 
+
+# =========================
+# HELPERS
+# =========================
 
 def safe_div(a, b):
     return float(a / (b + 1e-6))
@@ -241,6 +260,10 @@ def is_valid_ppg_signal(ir, red):
 
     return True, "Valid finger PPG signal"
 
+
+# =========================
+# WINDOW FEATURE EXTRACTION
+# =========================
 
 def basic_features(x):
     x = clean_signal(x)
@@ -496,7 +519,7 @@ def relation_features(ir_w, red_w):
     }
 
 
-def extract_features(ir, red):
+def extract_window_features(ir, red):
     ir = np.array(ir, dtype=np.float64)
     red = np.array(red, dtype=np.float64)
 
@@ -540,6 +563,152 @@ def extract_features(ir, red):
     return features
 
 
+# =========================
+# PATIENT-LEVEL AGGREGATION
+# =========================
+
+def create_windows(ir, red):
+    ir = np.array(ir, dtype=np.float64)
+    red = np.array(red, dtype=np.float64)
+
+    min_len = min(len(ir), len(red))
+    ir = ir[:min_len]
+    red = red[:min_len]
+
+    windows = []
+
+    if min_len < WINDOW_SIZE:
+        windows.append((ir, red))
+        return windows
+
+    for start in range(0, min_len - WINDOW_SIZE + 1, STEP_SIZE):
+        end = start + WINDOW_SIZE
+        windows.append((ir[start:end], red[start:end]))
+
+    if len(windows) == 0:
+        windows.append((ir, red))
+
+    return windows
+
+
+def iqr_func(values):
+    values = np.array(values, dtype=np.float64)
+    if len(values) == 0:
+        return 0
+    return float(np.percentile(values, 75) - np.percentile(values, 25))
+
+
+def aggregate_patient_level(window_feature_rows):
+    window_df = pd.DataFrame(window_feature_rows)
+    window_df = window_df.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    patient_features = {}
+
+    for col in window_df.columns:
+        values = pd.to_numeric(window_df[col], errors="coerce")
+        values = values.replace([np.inf, -np.inf], np.nan).fillna(0).values
+
+        patient_features[f"{col}_mean"] = float(np.mean(values))
+        patient_features[f"{col}_std"] = float(np.std(values))
+        patient_features[f"{col}_median"] = float(np.median(values))
+        patient_features[f"{col}_min"] = float(np.min(values))
+        patient_features[f"{col}_max"] = float(np.max(values))
+        patient_features[f"{col}_iqr_func"] = iqr_func(values)
+
+    patient_features["num_windows"] = len(window_feature_rows)
+
+    return patient_features
+
+
+def build_patient_features(ir, red):
+    windows = create_windows(ir, red)
+
+    rows = []
+    for ir_w, red_w in windows:
+        rows.append(extract_window_features(ir_w, red_w))
+
+    return aggregate_patient_level(rows)
+
+
+# =========================
+# QUALITY FEATURES
+# =========================
+# Current deployed model expects quality columns.
+# If exact reference statistics are not available in API, use safe defaults = 0.
+# This keeps column compatibility with the trained model.
+
+def add_quality_defaults(features):
+    quality_cols = [
+        "quality_global_mean_abs_z",
+        "quality_global_max_abs_z",
+        "quality_ir_mean_abs_z",
+        "quality_red_mean_abs_z",
+        "quality_relation_mean_abs_z",
+        "quality_rr_instability_z",
+        "quality_frequency_instability_z",
+        "quality_amplitude_instability_z",
+        "quality_variability_instability_z",
+        "quality_rr_max_abs_z",
+        "quality_frequency_max_abs_z",
+        "quality_amplitude_max_abs_z",
+        "quality_variability_max_abs_z",
+        "quality_flag_global_outlier",
+        "quality_flag_extreme_outlier",
+        "quality_flag_rr_unstable",
+        "quality_flag_frequency_unstable",
+        "quality_flag_amplitude_unstable",
+        "quality_flag_variability_unstable",
+    ]
+
+    for col in quality_cols:
+        if col not in features:
+            features[col] = 0.0
+
+    return features
+
+
+def classify_glucose_range(glucose):
+    if glucose < 70:
+        return "Low"
+    elif glucose < 140:
+        return "Normal"
+    elif glucose < 180:
+        return "Elevated"
+    elif glucose < 250:
+        return "High"
+    else:
+        return "Very High"
+
+
+def get_confidence_and_warning(diabetic, predicted_glucose):
+    if diabetic == 0:
+        if predicted_glucose < 70 or predicted_glucose > 160:
+            return (
+                "medium",
+                "Non-diabetic estimate outside usual range. Repeat measurement or confirm if symptoms exist."
+            )
+        return (
+            "medium",
+            "Experimental non-invasive estimate. Not a replacement for glucometer."
+        )
+
+    # Diabetic model has higher error in evaluation
+    if predicted_glucose >= 180:
+        return (
+            "low",
+            "Diabetic/high-glucose estimate has higher uncertainty. Confirm with glucometer."
+        )
+
+    return (
+        "low",
+        "Diabetic estimate has higher uncertainty. Confirm with glucometer if symptoms exist."
+    )
+
+
+# =========================
+# PREDICTION ROUTE
+# =========================
+
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
@@ -560,7 +729,12 @@ def predict():
         if len(ir) != len(red):
             return jsonify({"error": "ir and red length mismatch"}), 400
 
-        print(f"Received samples: IR={len(ir)}, RED={len(red)}")
+        diabetic = int(data.get("diabetic", 0))
+
+        if diabetic not in [0, 1]:
+            return jsonify({"error": "diabetic must be 0 or 1"}), 400
+
+        print(f"Received samples: IR={len(ir)}, RED={len(red)}, diabetic={diabetic}")
 
         valid_signal, reason = is_valid_ppg_signal(ir, red)
 
@@ -573,14 +747,19 @@ def predict():
 
         print("VALID SIGNAL:", reason)
 
-        features = extract_features(ir, red)
+        # Patient-level features from windows
+        features = build_patient_features(ir, red)
 
-        features["age"] = data.get("age", 25)
-        features["gender"] = data.get("gender", 0)
-        features["diabetic"] = data.get("diabetic", 0)
-        features["fasting"] = data.get("fasting", 0)
-        features["meal_time_hr"] = data.get("meal_time_hr", 2)
-        features["motion_artifact"] = data.get("motion_artifact", 0)
+        # Metadata
+        features["age"] = float(data.get("age", 25))
+        features["gender"] = float(data.get("gender", 0))
+        features["diabetic"] = diabetic
+        features["fasting"] = float(data.get("fasting", 0))
+        features["meal_time_hr"] = float(data.get("meal_time_hr", 2))
+        features["motion_artifact"] = float(data.get("motion_artifact", 0))
+
+        # Quality columns fallback
+        features = add_quality_defaults(features)
 
         X = pd.DataFrame([features])
 
@@ -592,19 +771,26 @@ def predict():
         X = X.replace([np.inf, -np.inf], 0)
         X = X.fillna(0)
 
-        # =========================
-        # RAW MODEL PREDICTION
-        # =========================
-        raw_pred = float(model.predict(X)[0])
+        # Select model
+        if diabetic == 0:
+            selected_model = non_diabetic_model
+            model_used = "non_diabetic_model"
+        else:
+            selected_model = diabetic_model
+            model_used = "diabetic_model"
 
-        # Wide realistic range
-        raw_pred = max(50, min(raw_pred, 350))
+        # Raw model prediction
+        raw_pred = float(selected_model.predict(X)[0])
+
+        if diabetic == 0:
+            # Same safety clamp used during evaluation
+            raw_pred = max(50, min(raw_pred, 180))
+        else:
+            raw_pred = max(50, min(raw_pred, 450))
 
         global prediction_history
 
-        # =========================
-        # ADAPTIVE SMOOTHING
-        # =========================
+        # Adaptive smoothing
         if len(prediction_history) == 0:
             final_pred = raw_pred
         else:
@@ -612,37 +798,37 @@ def predict():
             diff = abs(raw_pred - last_smoothed)
 
             if diff > 40:
-                # Big real jump -> allow it
                 final_pred = raw_pred
                 prediction_history = [raw_pred]
 
             elif diff > 20:
-                # Medium jump -> light smoothing
-                final_pred = (
-                    0.70 * raw_pred
-                ) + (
-                    0.30 * last_smoothed
-                )
+                final_pred = (0.70 * raw_pred) + (0.30 * last_smoothed)
 
             else:
-                # Small normal fluctuation
-                final_pred = (
-                    0.45 * raw_pred
-                ) + (
-                    0.55 * last_smoothed
-                )
+                final_pred = (0.45 * raw_pred) + (0.55 * last_smoothed)
 
         prediction_history.append(final_pred)
 
         if len(prediction_history) > MAX_HISTORY:
             prediction_history.pop(0)
 
+        glucose_range = classify_glucose_range(final_pred)
+        confidence, warning = get_confidence_and_warning(diabetic, final_pred)
+
+        print("MODEL USED:", model_used)
         print("RAW PREDICTED:", raw_pred)
         print("FINAL PREDICTED:", final_pred)
+        print("RANGE:", glucose_range)
 
         return jsonify({
             "predicted_glucose": round(float(final_pred), 1),
-            "raw_glucose": round(float(raw_pred), 1)
+            "raw_glucose": round(float(raw_pred), 1),
+            "glucose_range": glucose_range,
+            "confidence": confidence,
+            "warning": warning,
+            "model_used": model_used,
+            "diabetic": diabetic,
+            "num_windows": int(features.get("num_windows", 1))
         }), 200
 
     except Exception as e:
