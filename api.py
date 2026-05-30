@@ -8,9 +8,15 @@ from scipy.signal import find_peaks
 from scipy.fft import rfft, rfftfreq
 from scipy.stats import skew, kurtosis
 
+
+# =========================
+# APP CONFIG
+# =========================
+
 app = Flask(__name__)
 
 FS = 100
+
 WINDOW_SIZE_SEC = 6
 STEP_SIZE_SEC = 0.5
 
@@ -20,8 +26,9 @@ STEP_SIZE = int(STEP_SIZE_SEC * FS)
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 
+
 # =========================
-# LOAD TWO MODELS
+# LOAD MODELS
 # =========================
 
 non_diabetic_model = joblib.load(MODELS_DIR / "non_diabetic_glucose_model.pkl")
@@ -32,9 +39,14 @@ print("TWO-GROUP MODELS LOADED SUCCESSFULLY")
 print("Number of model features:", len(features_order))
 print("Models dir:", MODELS_DIR)
 
+
 # =========================
 # ADAPTIVE SMOOTHING
 # =========================
+# During testing, keep smoothing disabled to see raw model behavior clearly.
+# Later, you can set USE_SMOOTHING = True.
+
+USE_SMOOTHING = False
 
 prediction_history = []
 MAX_HISTORY = 5
@@ -50,7 +62,7 @@ def home():
 
 
 # =========================
-# HELPERS
+# BASIC HELPERS
 # =========================
 
 def safe_div(a, b):
@@ -121,6 +133,10 @@ def estimate_signal_bpm(x, fs=100, prominence_ratio=0.08):
 
     return float(bpm), float(regularity), len(peaks)
 
+
+# =========================
+# SIGNAL VALIDATION
+# =========================
 
 def is_valid_ppg_signal(ir, red):
     ir = np.array(ir, dtype=np.float64)
@@ -262,7 +278,7 @@ def is_valid_ppg_signal(ir, red):
 
 
 # =========================
-# WINDOW FEATURE EXTRACTION
+# FEATURE EXTRACTION
 # =========================
 
 def basic_features(x):
@@ -631,11 +647,8 @@ def build_patient_features(ir, red):
 
 
 # =========================
-# QUALITY FEATURES
+# QUALITY DEFAULTS
 # =========================
-# Current deployed model expects quality columns.
-# If exact reference statistics are not available in API, use safe defaults = 0.
-# This keeps column compatibility with the trained model.
 
 def add_quality_defaults(features):
     quality_cols = [
@@ -667,6 +680,10 @@ def add_quality_defaults(features):
     return features
 
 
+# =========================
+# OUTPUT HELPERS
+# =========================
+
 def classify_glucose_range(glucose):
     if glucose < 70:
         return "Low"
@@ -680,19 +697,25 @@ def classify_glucose_range(glucose):
         return "Very High"
 
 
-def get_confidence_and_warning(diabetic, predicted_glucose):
+def get_confidence_and_warning(diabetic, predicted_glucose, fasting, meal_time_hr):
     if diabetic == 0:
+        if fasting == 0 and meal_time_hr <= 1.5:
+            return (
+                "medium",
+                "Post-meal non-diabetic estimate. Experimental result; confirm if symptoms exist."
+            )
+
         if predicted_glucose < 70 or predicted_glucose > 160:
             return (
                 "medium",
                 "Non-diabetic estimate outside usual range. Repeat measurement or confirm if symptoms exist."
             )
+
         return (
             "medium",
             "Experimental non-invasive estimate. Not a replacement for glucometer."
         )
 
-    # Diabetic model has higher error in evaluation
     if predicted_glucose >= 180:
         return (
             "low",
@@ -703,6 +726,26 @@ def get_confidence_and_warning(diabetic, predicted_glucose):
         "low",
         "Diabetic estimate has higher uncertainty. Confirm with glucometer if symptoms exist."
     )
+
+
+def apply_post_meal_correction(raw_pred, diabetic, fasting, meal_time_hr):
+    correction_applied = False
+    correction_reason = None
+
+    if diabetic == 0 and fasting == 0:
+        if meal_time_hr <= 1.5:
+            if raw_pred < 120:
+                raw_pred = 120
+                correction_applied = True
+                correction_reason = "non_diabetic_recent_meal_floor_120"
+
+        elif meal_time_hr <= 3:
+            if raw_pred < 110:
+                raw_pred = 110
+                correction_applied = True
+                correction_reason = "non_diabetic_post_meal_floor_110"
+
+    return raw_pred, correction_applied, correction_reason
 
 
 # =========================
@@ -729,12 +772,30 @@ def predict():
         if len(ir) != len(red):
             return jsonify({"error": "ir and red length mismatch"}), 400
 
+        # Metadata from Flutter
+        age = float(data.get("age", 25))
+        gender = float(data.get("gender", 0))
         diabetic = int(data.get("diabetic", 0))
+        fasting = int(data.get("fasting", 0))
+        meal_time_hr = float(data.get("meal_time_hr", 2))
+        motion_artifact = float(data.get("motion_artifact", 0))
 
         if diabetic not in [0, 1]:
             return jsonify({"error": "diabetic must be 0 or 1"}), 400
 
+        if fasting not in [0, 1]:
+            return jsonify({"error": "fasting must be 0 or 1"}), 400
+
         print(f"Received samples: IR={len(ir)}, RED={len(red)}, diabetic={diabetic}")
+
+        print("INCOMING METADATA:", {
+            "age": age,
+            "gender": gender,
+            "diabetic": diabetic,
+            "fasting": fasting,
+            "meal_time_hr": meal_time_hr,
+            "motion_artifact": motion_artifact,
+        })
 
         valid_signal, reason = is_valid_ppg_signal(ir, red)
 
@@ -747,18 +808,18 @@ def predict():
 
         print("VALID SIGNAL:", reason)
 
-        # Patient-level features from windows
+        # Patient-level features
         features = build_patient_features(ir, red)
 
-        # Metadata
-        features["age"] = float(data.get("age", 25))
-        features["gender"] = float(data.get("gender", 0))
+        # Add metadata
+        features["age"] = age
+        features["gender"] = gender
         features["diabetic"] = diabetic
-        features["fasting"] = float(data.get("fasting", 0))
-        features["meal_time_hr"] = float(data.get("meal_time_hr", 2))
-        features["motion_artifact"] = float(data.get("motion_artifact", 0))
+        features["fasting"] = fasting
+        features["meal_time_hr"] = meal_time_hr
+        features["motion_artifact"] = motion_artifact
 
-        # Quality columns fallback
+        # Add quality feature defaults
         features = add_quality_defaults(features)
 
         X = pd.DataFrame([features])
@@ -780,55 +841,85 @@ def predict():
             model_used = "diabetic_model"
 
         # Raw model prediction
-        raw_pred = float(selected_model.predict(X)[0])
+        raw_model_pred = float(selected_model.predict(X)[0])
 
+        # Apply post-meal correction
+        corrected_pred, correction_applied, correction_reason = apply_post_meal_correction(
+            raw_model_pred,
+            diabetic,
+            fasting,
+            meal_time_hr,
+        )
+
+        # Clamp by model group
         if diabetic == 0:
-            # Same safety clamp used during evaluation
-            raw_pred = max(50, min(raw_pred, 180))
+            corrected_pred = max(50, min(corrected_pred, 180))
         else:
-            raw_pred = max(50, min(raw_pred, 450))
+            corrected_pred = max(50, min(corrected_pred, 450))
 
         global prediction_history
 
-        # Adaptive smoothing
-        if len(prediction_history) == 0:
-            final_pred = raw_pred
-        else:
-            last_smoothed = float(np.mean(prediction_history))
-            diff = abs(raw_pred - last_smoothed)
-
-            if diff > 40:
-                final_pred = raw_pred
-                prediction_history = [raw_pred]
-
-            elif diff > 20:
-                final_pred = (0.70 * raw_pred) + (0.30 * last_smoothed)
-
+        if USE_SMOOTHING:
+            if len(prediction_history) == 0:
+                final_pred = corrected_pred
             else:
-                final_pred = (0.45 * raw_pred) + (0.55 * last_smoothed)
+                last_smoothed = float(np.mean(prediction_history))
+                diff = abs(corrected_pred - last_smoothed)
 
-        prediction_history.append(final_pred)
+                if diff > 40:
+                    final_pred = corrected_pred
+                    prediction_history = [corrected_pred]
 
-        if len(prediction_history) > MAX_HISTORY:
-            prediction_history.pop(0)
+                elif diff > 20:
+                    final_pred = (0.70 * corrected_pred) + (0.30 * last_smoothed)
+
+                else:
+                    final_pred = (0.45 * corrected_pred) + (0.55 * last_smoothed)
+
+            prediction_history.append(final_pred)
+
+            if len(prediction_history) > MAX_HISTORY:
+                prediction_history.pop(0)
+
+        else:
+            final_pred = corrected_pred
+            prediction_history = [corrected_pred]
 
         glucose_range = classify_glucose_range(final_pred)
-        confidence, warning = get_confidence_and_warning(diabetic, final_pred)
+        confidence, warning = get_confidence_and_warning(
+            diabetic,
+            final_pred,
+            fasting,
+            meal_time_hr,
+        )
 
         print("MODEL USED:", model_used)
-        print("RAW PREDICTED:", raw_pred)
+        print("RAW MODEL PREDICTED:", raw_model_pred)
+        print("CORRECTED PREDICTED:", corrected_pred)
         print("FINAL PREDICTED:", final_pred)
+        print("CORRECTION APPLIED:", correction_applied, correction_reason)
         print("RANGE:", glucose_range)
 
         return jsonify({
             "predicted_glucose": round(float(final_pred), 1),
-            "raw_glucose": round(float(raw_pred), 1),
+            "raw_glucose": round(float(raw_model_pred), 1),
+            "corrected_glucose": round(float(corrected_pred), 1),
             "glucose_range": glucose_range,
             "confidence": confidence,
             "warning": warning,
             "model_used": model_used,
             "diabetic": diabetic,
-            "num_windows": int(features.get("num_windows", 1))
+            "num_windows": int(features.get("num_windows", 1)),
+            "correction_applied": correction_applied,
+            "correction_reason": correction_reason,
+            "metadata_received": {
+                "age": age,
+                "gender": gender,
+                "diabetic": diabetic,
+                "fasting": fasting,
+                "meal_time_hr": meal_time_hr,
+                "motion_artifact": motion_artifact,
+            }
         }), 200
 
     except Exception as e:
