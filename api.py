@@ -41,13 +41,11 @@ USE_SMOOTHING = True
 
 prediction_history = []
 
-# آخر 3 قراءات فقط عشان القراءة تستجيب أسرع
 MAX_HISTORY = 3
 
-# لو قراءة نطت أكتر من كده عن آخر median نرفضها
-OUTLIER_THRESHOLD = 40.0
+# خليناه 30 بدل 40 عشان القفزات زي 172 تتفلتر أسرع
+OUTLIER_THRESHOLD = 30.0
 
-# أول قراءتين warm-up
 WARMUP_READINGS = 2
 
 
@@ -215,20 +213,18 @@ def is_valid_ppg_signal(ir, red):
     if not np.isfinite(corr):
         return False, "Invalid IR/RED correlation"
 
-    if corr < 0.50:
+    # correlation أخف من النسخة اللي كانت بترفض كتير
+    if corr < 0.45:
         return False, "IR/RED correlation too weak"
 
-    if corr < 0.60:
-        return False, "IR/RED signals are not correlated enough"
-
-    # Stronger signal thresholds
-    if ir_range < 250 or red_range < 120:
+    # signal thresholds متوازنة
+    if ir_range < 200 or red_range < 100:
         return False, "Signal range too weak for reliable prediction"
 
-    if ir_cv < 0.002 or red_cv < 0.0015:
+    if ir_cv < 0.0015 or red_cv < 0.001:
         return False, "PPG variation too weak for reliable prediction"
 
-    if ir_std < 80 or red_std < 35:
+    if ir_std < 50 or red_std < 30:
         return False, "Signal amplitude too weak for reliable prediction"
 
     if ir_mean > 400000 or red_mean > 400000:
@@ -243,10 +239,10 @@ def is_valid_ppg_signal(ir, red):
     if abs(ir_bpm - red_bpm) > 35:
         return False, "IR and RED pulse rates do not match"
 
-    if ir_regularity is None or ir_regularity > 0.50:
+    if ir_regularity is None or ir_regularity > 0.60:
         return False, "IR pulse is unstable"
 
-    if red_regularity is None or red_regularity > 0.50:
+    if red_regularity is None or red_regularity > 0.60:
         return False, "RED pulse is unstable"
 
     if ir_peaks < 3:
