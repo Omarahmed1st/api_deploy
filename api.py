@@ -34,22 +34,30 @@ print("Models dir:", MODELS_DIR, flush=True)
 
 
 # =========================
-# SMOOTHING
+# STABILITY SETTINGS
 # =========================
 
-USE_SMOOTHING = False
+USE_SMOOTHING = True
 
 prediction_history = []
 MAX_HISTORY = 5
+
+# لو القراءة الجديدة بعيدة أكتر من كده عن آخر median، نعتبرها outlier
+OUTLIER_THRESHOLD = 40.0
+
+# أول كام قراءة تعتبر warm-up
+WARMUP_READINGS = 2
 
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "API RUNNING",
-        "model_type": "ppg_only_window_level_model",
+        "model_type": "ppg_only_window_level_model_stable",
         "features": len(features_order),
         "smoothing": USE_SMOOTHING,
+        "max_history": MAX_HISTORY,
+        "outlier_threshold": OUTLIER_THRESHOLD,
         "metadata_used_by_model": False
     })
 
@@ -205,6 +213,10 @@ def is_valid_ppg_signal(ir, red):
     if not np.isfinite(corr):
         return False, "Invalid IR/RED correlation"
 
+    # شرط أقوى: correlation ضعيف جدًا يترفض حتى لو فيه peaks
+    if corr < 0.50:
+        return False, "IR/RED correlation too weak"
+
     strong_contact = (
         ir_mean >= 18000 and
         red_mean >= 12000 and
@@ -227,10 +239,10 @@ def is_valid_ppg_signal(ir, red):
         red_peaks >= 3
     )
 
-    if corr < 0.45 and not pulse_match_ok:
-        return False, "IR/RED signals are not correlated"
+    if corr < 0.60 and not pulse_match_ok:
+        return False, "IR/RED signals are not correlated enough"
 
-    if (ir_std < 80 or red_std < 50) and not (strong_contact and has_pulse_evidence):
+    if (ir_std < 80 or red_std < 35) and not (strong_contact and has_pulse_evidence):
         return False, "Signal amplitude too weak for finger contact"
 
     if (ir_range < 250 or red_range < 100) and not (strong_contact and has_pulse_evidence):
@@ -245,27 +257,29 @@ def is_valid_ppg_signal(ir, red):
     if ir_bpm is None:
         return False, "No valid IR pulse detected"
 
-    if ir_regularity is None or ir_regularity > 0.70:
-        return False, "IR pulse is not regular enough"
+    if red_bpm is None:
+        return False, "No valid RED pulse detected"
+
+    if abs(ir_bpm - red_bpm) > 35:
+        return False, "IR and RED pulse rates do not match"
+
+    if ir_regularity is None or ir_regularity > 0.50:
+        return False, "IR pulse is unstable"
+
+    if red_regularity is None or red_regularity > 0.50:
+        return False, "RED pulse is unstable"
 
     if ir_peaks < 3:
         return False, "Not enough IR pulse peaks"
 
+    if red_peaks < 3:
+        return False, "Not enough RED pulse peaks"
+
     if ir_peaks > 18:
         return False, "Too many random IR peaks"
 
-    if red_bpm is not None:
-        if abs(ir_bpm - red_bpm) > 35:
-            return False, "IR and RED pulse rates do not match"
-
-        if red_regularity is not None and red_regularity > 0.75:
-            return False, "RED pulse is not regular enough"
-    else:
-        if corr < 0.85:
-            return False, "RED pulse not detected and correlation is not high enough"
-
-        if red_peaks < 1:
-            return False, "No RED pulse activity detected"
+    if red_peaks > 18:
+        return False, "Too many random RED peaks"
 
     return True, "Valid finger PPG signal"
 
@@ -589,11 +603,55 @@ def classify_glucose_range(glucose):
         return "Very High"
 
 
-def get_confidence_and_warning():
+def get_confidence_and_warning(display_ready):
+    if not display_ready:
+        return (
+            "warming_up",
+            "Collecting stable PPG readings. Final value may change."
+        )
+
     return (
         "medium",
         "Experimental non-invasive estimate. Not a replacement for glucometer."
     )
+
+
+def stabilize_prediction(clipped_pred):
+    global prediction_history
+
+    outlier_rejected = False
+    outlier_reason = None
+
+    if not USE_SMOOTHING:
+        prediction_history = [clipped_pred]
+        return clipped_pred, outlier_rejected, outlier_reason
+
+    if len(prediction_history) > 0:
+        current_median = float(np.median(prediction_history))
+        diff = abs(clipped_pred - current_median)
+
+        if diff > OUTLIER_THRESHOLD:
+            outlier_rejected = True
+            outlier_reason = f"Reading jump {diff:.1f} mg/dL from recent median"
+
+            final_pred = current_median
+
+            print("OUTLIER REJECTED:", {
+                "raw_clipped": clipped_pred,
+                "recent_median": current_median,
+                "diff": diff
+            }, flush=True)
+
+            return final_pred, outlier_rejected, outlier_reason
+
+    prediction_history.append(clipped_pred)
+
+    if len(prediction_history) > MAX_HISTORY:
+        prediction_history.pop(0)
+
+    final_pred = float(np.median(prediction_history))
+
+    return final_pred, outlier_rejected, outlier_reason
 
 
 # =========================
@@ -655,14 +713,10 @@ def predict():
 
         print("VALID SIGNAL:", reason, flush=True)
 
-        # IMPORTANT:
-        # Use window-level features because the PPG-only model was trained
-        # on normal feature names like ir_mean, ir_std, red_mean, etc.
         features = extract_window_features(ir, red)
 
         X = pd.DataFrame([features])
 
-        # Debug feature matching
         api_features = set(X.columns)
         model_features = set(features_order)
 
@@ -678,8 +732,6 @@ def predict():
         print("FIRST 20 MATCHED:", list(matched)[:20], flush=True)
         print("FIRST 20 MISSING:", list(missing)[:20], flush=True)
 
-        # This guarantees the model uses only the columns it was trained on.
-        # Metadata like age/gender/diabetic is not present here, so it cannot affect prediction.
         X = X.reindex(columns=features_order, fill_value=0)
 
         X = X.replace([np.inf, -np.inf], 0)
@@ -687,40 +739,46 @@ def predict():
 
         raw_model_pred = float(model.predict(X)[0])
 
-        # Conservative clipping only
+        # Conservative clipping
         clipped_pred = max(50, min(raw_model_pred, 450))
 
-        global prediction_history
+        final_pred, outlier_rejected, outlier_reason = stabilize_prediction(
+            clipped_pred
+        )
 
-        if USE_SMOOTHING:
-            prediction_history.append(clipped_pred)
-
-            if len(prediction_history) > MAX_HISTORY:
-                prediction_history.pop(0)
-
-            final_pred = float(np.mean(prediction_history))
-        else:
-            final_pred = clipped_pred
-            prediction_history = [clipped_pred]
+        display_ready = len(prediction_history) >= WARMUP_READINGS
 
         glucose_range = classify_glucose_range(final_pred)
-        confidence, warning = get_confidence_and_warning()
+        confidence, warning = get_confidence_and_warning(display_ready)
 
-        print("MODEL USED: ppg_only_window_level_model", flush=True)
+        print("MODEL USED: ppg_only_window_level_model_stable", flush=True)
         print("RAW MODEL PREDICTED:", raw_model_pred, flush=True)
-        print("FINAL PREDICTED:", final_pred, flush=True)
+        print("CLIPPED PREDICTED:", clipped_pred, flush=True)
+        print("FINAL STABLE PREDICTED:", final_pred, flush=True)
+        print("PREDICTION HISTORY:", prediction_history, flush=True)
+        print("OUTLIER REJECTED:", outlier_rejected, outlier_reason, flush=True)
+        print("DISPLAY READY:", display_ready, flush=True)
         print("RANGE:", glucose_range, flush=True)
         print("METADATA USED BY MODEL: False", flush=True)
 
         return jsonify({
             "predicted_glucose": round(float(final_pred), 1),
             "raw_glucose": round(float(raw_model_pred), 1),
+            "clipped_glucose": round(float(clipped_pred), 1),
             "glucose_range": glucose_range,
             "confidence": confidence,
             "warning": warning,
-            "model_used": "ppg_only_window_level_model",
+            "model_used": "ppg_only_window_level_model_stable",
             "metadata_used_by_model": False,
             "smoothing_used": USE_SMOOTHING,
+            "display_ready": display_ready,
+            "warmup_readings": WARMUP_READINGS,
+            "history_count": len(prediction_history),
+            "prediction_history": [
+                round(float(x), 1) for x in prediction_history
+            ],
+            "outlier_rejected": outlier_rejected,
+            "outlier_reason": outlier_reason,
             "signal_status": reason,
             "used_features": len(features_order),
             "feature_debug": {
@@ -745,6 +803,18 @@ def predict():
     except Exception as e:
         print("ERROR:", e, flush=True)
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/reset", methods=["POST", "GET"])
+def reset_prediction_history():
+    global prediction_history
+
+    prediction_history = []
+
+    return jsonify({
+        "status": "reset done",
+        "prediction_history": prediction_history
+    })
 
 
 if __name__ == "__main__":
