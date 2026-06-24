@@ -28,14 +28,13 @@ MODELS_DIR = BASE_DIR / "models"
 
 
 # =========================
-# LOAD MODELS
+# LOAD PPG-ONLY MODEL
 # =========================
 
-non_diabetic_model = joblib.load(MODELS_DIR / "non_diabetic_glucose_model.pkl")
-diabetic_model = joblib.load(MODELS_DIR / "diabetic_glucose_model.pkl")
-features_order = joblib.load(MODELS_DIR / "two_group_model_features.pkl")
+model = joblib.load(MODELS_DIR / "glucose_model_ppg_only.pkl")
+features_order = joblib.load(MODELS_DIR / "model_features_ppg_only.pkl")
 
-print("TWO-GROUP MODELS LOADED SUCCESSFULLY", flush=True)
+print("PPG-ONLY MODEL LOADED SUCCESSFULLY", flush=True)
 print("Number of model features:", len(features_order), flush=True)
 print("Models dir:", MODELS_DIR, flush=True)
 
@@ -43,7 +42,7 @@ print("Models dir:", MODELS_DIR, flush=True)
 # =========================
 # SMOOTHING
 # =========================
-# Keep False during testing so prediction = raw model output.
+
 USE_SMOOTHING = False
 
 prediction_history = []
@@ -54,9 +53,10 @@ MAX_HISTORY = 5
 def home():
     return jsonify({
         "status": "API RUNNING",
-        "model_type": "two_group_patient_level_model",
+        "model_type": "ppg_only_model",
         "features": len(features_order),
-        "smoothing": USE_SMOOTHING
+        "smoothing": USE_SMOOTHING,
+        "metadata_used_by_model": False
     })
 
 
@@ -608,8 +608,10 @@ def create_windows(ir, red):
 
 def iqr_func(values):
     values = np.array(values, dtype=np.float64)
+
     if len(values) == 0:
         return 0
+
     return float(np.percentile(values, 75) - np.percentile(values, 25))
 
 
@@ -639,6 +641,7 @@ def build_patient_features(ir, red):
     windows = create_windows(ir, red)
 
     rows = []
+
     for ir_w, red_w in windows:
         rows.append(extract_window_features(ir_w, red_w))
 
@@ -696,24 +699,11 @@ def classify_glucose_range(glucose):
         return "Very High"
 
 
-def get_confidence_and_warning(diabetic, predicted_glucose, fasting, meal_time_hr):
-    if diabetic == 0:
-        return (
-            "medium",
-            "Experimental non-invasive estimate. Not a replacement for glucometer."
-        )
-
+def get_confidence_and_warning(predicted_glucose):
     return (
-        "low",
-        "Diabetic estimate has higher uncertainty. Confirm with glucometer if symptoms exist."
+        "medium",
+        "Experimental non-invasive estimate. Not a replacement for glucometer."
     )
-
-
-def apply_post_meal_correction(raw_pred, diabetic, fasting, meal_time_hr):
-    # No forced correction.
-    # Meal information is used as a model input feature only.
-    # This prevents fixed outputs like 120.
-    return raw_pred, False, None
 
 
 # =========================
@@ -740,6 +730,8 @@ def predict():
         if len(ir) != len(red):
             return jsonify({"error": "ir and red length mismatch"}), 400
 
+        # Metadata is received only for logging/app display.
+        # It is NOT used by the PPG-only model.
         age = float(data.get("age", 25))
         gender = float(data.get("gender", 0))
         diabetic = int(data.get("diabetic", 0))
@@ -747,18 +739,12 @@ def predict():
         meal_time_hr = float(data.get("meal_time_hr", 2))
         motion_artifact = float(data.get("motion_artifact", 0))
 
-        if diabetic not in [0, 1]:
-            return jsonify({"error": "diabetic must be 0 or 1"}), 400
-
-        if fasting not in [0, 1]:
-            return jsonify({"error": "fasting must be 0 or 1"}), 400
-
         if fasting == 1:
             meal_time_hr = 0.0
 
-        print(f"Received samples: IR={len(ir)}, RED={len(red)}, diabetic={diabetic}", flush=True)
+        print(f"Received samples: IR={len(ir)}, RED={len(red)}", flush=True)
 
-        print("INCOMING METADATA:", {
+        print("INCOMING METADATA - NOT USED BY MODEL:", {
             "age": age,
             "gender": gender,
             "diabetic": diabetic,
@@ -771,6 +757,7 @@ def predict():
 
         if not valid_signal:
             print("INVALID SIGNAL:", reason, flush=True)
+
             return jsonify({
                 "error": "Invalid finger PPG signal",
                 "reason": reason
@@ -778,104 +765,62 @@ def predict():
 
         print("VALID SIGNAL:", reason, flush=True)
 
+        # Build PPG-only features
         features = build_patient_features(ir, red)
 
-        features["age"] = age
-        features["gender"] = gender
-        features["diabetic"] = diabetic
-        features["fasting"] = fasting
-        features["meal_time_hr"] = meal_time_hr
-        features["motion_artifact"] = motion_artifact
-
+        # Add quality defaults only if the model expects any of them.
         features = add_quality_defaults(features)
 
         X = pd.DataFrame([features])
 
-        for col in features_order:
-            if col not in X.columns:
-                X[col] = 0
+        # Important:
+        # This line guarantees the model uses ONLY the columns it was trained on.
+        # If age/gender/diabetic/etc are not in model_features_ppg_only.pkl,
+        # they will never affect the prediction.
+        X = X.reindex(columns=features_order, fill_value=0)
 
-        X = X[features_order]
         X = X.replace([np.inf, -np.inf], 0)
         X = X.fillna(0)
 
-        if diabetic == 0:
-            selected_model = non_diabetic_model
-            model_used = "non_diabetic_model"
-        else:
-            selected_model = diabetic_model
-            model_used = "diabetic_model"
+        raw_model_pred = float(model.predict(X)[0])
 
-        raw_model_pred = float(selected_model.predict(X)[0])
-
-        corrected_pred, correction_applied, correction_reason = apply_post_meal_correction(
-            raw_model_pred,
-            diabetic,
-            fasting,
-            meal_time_hr,
-        )
-
-        if diabetic == 0:
-            corrected_pred = max(50, min(corrected_pred, 180))
-        else:
-            corrected_pred = max(50, min(corrected_pred, 450))
+        # Conservative clipping only
+        final_input_pred = max(50, min(raw_model_pred, 450))
 
         global prediction_history
 
         if USE_SMOOTHING:
-            if len(prediction_history) == 0:
-                final_pred = corrected_pred
-            else:
-                last_smoothed = float(np.mean(prediction_history))
-                diff = abs(corrected_pred - last_smoothed)
-
-                if diff > 40:
-                    final_pred = corrected_pred
-                    prediction_history = [corrected_pred]
-
-                elif diff > 20:
-                    final_pred = (0.70 * corrected_pred) + (0.30 * last_smoothed)
-
-                else:
-                    final_pred = (0.45 * corrected_pred) + (0.55 * last_smoothed)
-
-            prediction_history.append(final_pred)
+            prediction_history.append(final_input_pred)
 
             if len(prediction_history) > MAX_HISTORY:
                 prediction_history.pop(0)
 
+            final_pred = float(np.mean(prediction_history))
         else:
-            final_pred = corrected_pred
-            prediction_history = [corrected_pred]
+            final_pred = final_input_pred
+            prediction_history = [final_input_pred]
 
         glucose_range = classify_glucose_range(final_pred)
-        confidence, warning = get_confidence_and_warning(
-            diabetic,
-            final_pred,
-            fasting,
-            meal_time_hr,
-        )
+        confidence, warning = get_confidence_and_warning(final_pred)
 
-        print("MODEL USED:", model_used, flush=True)
+        print("MODEL USED: ppg_only_model", flush=True)
         print("RAW MODEL PREDICTED:", raw_model_pred, flush=True)
-        print("CORRECTED PREDICTED:", corrected_pred, flush=True)
         print("FINAL PREDICTED:", final_pred, flush=True)
-        print("CORRECTION APPLIED:", correction_applied, correction_reason, flush=True)
         print("RANGE:", glucose_range, flush=True)
+        print("METADATA USED BY MODEL: False", flush=True)
 
         return jsonify({
             "predicted_glucose": round(float(final_pred), 1),
             "raw_glucose": round(float(raw_model_pred), 1),
-            "corrected_glucose": round(float(corrected_pred), 1),
             "glucose_range": glucose_range,
             "confidence": confidence,
             "warning": warning,
-            "model_used": model_used,
-            "diabetic": diabetic,
+            "model_used": "ppg_only_model",
+            "metadata_used_by_model": False,
             "num_windows": int(features.get("num_windows", 1)),
-            "correction_applied": correction_applied,
-            "correction_reason": correction_reason,
             "smoothing_used": USE_SMOOTHING,
+            "signal_status": reason,
+            "used_features": len(features_order),
             "metadata_received": {
                 "age": age,
                 "gender": gender,
