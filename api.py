@@ -29,8 +29,9 @@ model = joblib.load(MODELS_DIR / "glucose_model_ppg_only.pkl")
 features_order = joblib.load(MODELS_DIR / "model_features_ppg_only.pkl")
 
 print("PPG-ONLY MODEL LOADED SUCCESSFULLY", flush=True)
+print("Model file:", MODELS_DIR / "glucose_model_ppg_only.pkl", flush=True)
+print("Features file:", MODELS_DIR / "model_features_ppg_only.pkl", flush=True)
 print("Number of model features:", len(features_order), flush=True)
-print("Models dir:", MODELS_DIR, flush=True)
 
 
 # =========================
@@ -38,32 +39,47 @@ print("Models dir:", MODELS_DIR, flush=True)
 # =========================
 
 USE_SMOOTHING = True
-
 prediction_history = []
 
 MAX_HISTORY = 3
-
-# خليناه 30 بدل 40 عشان القفزات زي 172 تتفلتر أسرع
 OUTLIER_THRESHOLD = 30.0
-
 WARMUP_READINGS = 2
 
+
+# =========================
+# ROUTES
+# =========================
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "API RUNNING",
         "model_type": "ppg_only_window_level_model_stable",
+        "model_file": "glucose_model_ppg_only.pkl",
+        "features_file": "model_features_ppg_only.pkl",
         "features": len(features_order),
         "smoothing": USE_SMOOTHING,
         "max_history": MAX_HISTORY,
         "outlier_threshold": OUTLIER_THRESHOLD,
-        "metadata_used_by_model": False
+        "metadata_used_by_model": False,
+        "diabetic_used_by_model": False
+    })
+
+
+@app.route("/reset", methods=["POST", "GET"])
+def reset_prediction_history():
+    global prediction_history
+
+    prediction_history = []
+
+    return jsonify({
+        "status": "reset done",
+        "prediction_history": prediction_history
     })
 
 
 # =========================
-# BASIC HELPERS
+# HELPERS
 # =========================
 
 def safe_div(a, b):
@@ -213,11 +229,9 @@ def is_valid_ppg_signal(ir, red):
     if not np.isfinite(corr):
         return False, "Invalid IR/RED correlation"
 
-    # correlation أخف من النسخة اللي كانت بترفض كتير
     if corr < 0.45:
         return False, "IR/RED correlation too weak"
 
-    # signal thresholds متوازنة
     if ir_range < 200 or red_range < 100:
         return False, "Signal range too weak for reliable prediction"
 
@@ -654,8 +668,8 @@ def predict():
         if len(ir) != len(red):
             return jsonify({"error": "ir and red length mismatch"}), 400
 
-        # Metadata received only for logging.
-        # It is NOT used by the PPG-only model.
+        # Metadata is received only for logging and future personalization.
+        # It is NOT used by the final PPG-only model.
         age = float(data.get("age", 25))
         gender = float(data.get("gender", 0))
         diabetic = int(data.get("diabetic", 0))
@@ -684,7 +698,10 @@ def predict():
 
             return jsonify({
                 "error": "Invalid finger PPG signal",
-                "reason": reason
+                "reason": reason,
+                "display_ready": False,
+                "metadata_used_by_model": False,
+                "diabetic_used_by_model": False
             }), 422
 
         print("VALID SIGNAL:", reason, flush=True)
@@ -727,6 +744,8 @@ def predict():
         confidence, warning = get_confidence_and_warning(display_ready)
 
         print("MODEL USED: ppg_only_window_level_model_stable", flush=True)
+        print("MODEL FILE: glucose_model_ppg_only.pkl", flush=True)
+        print("FEATURES FILE: model_features_ppg_only.pkl", flush=True)
         print("RAW MODEL PREDICTED:", raw_model_pred, flush=True)
         print("CLIPPED PREDICTED:", clipped_pred, flush=True)
         print("FINAL STABLE PREDICTED:", final_pred, flush=True)
@@ -735,6 +754,7 @@ def predict():
         print("DISPLAY READY:", display_ready, flush=True)
         print("RANGE:", glucose_range, flush=True)
         print("METADATA USED BY MODEL: False", flush=True)
+        print("DIABETIC USED BY MODEL: False", flush=True)
 
         return jsonify({
             "predicted_glucose": round(float(final_pred), 1),
@@ -743,8 +763,14 @@ def predict():
             "glucose_range": glucose_range,
             "confidence": confidence,
             "warning": warning,
+
             "model_used": "ppg_only_window_level_model_stable",
+            "model_file": "glucose_model_ppg_only.pkl",
+            "features_file": "model_features_ppg_only.pkl",
+
             "metadata_used_by_model": False,
+            "diabetic_used_by_model": False,
+
             "smoothing_used": USE_SMOOTHING,
             "display_ready": display_ready,
             "warmup_readings": WARMUP_READINGS,
@@ -752,9 +778,11 @@ def predict():
             "prediction_history": [
                 round(float(x), 1) for x in prediction_history
             ],
+
             "outlier_rejected": outlier_rejected,
             "outlier_reason": outlier_reason,
             "signal_status": reason,
+
             "used_features": len(features_order),
             "feature_debug": {
                 "api_features": len(api_features),
@@ -765,6 +793,7 @@ def predict():
                 "first_20_matched": list(matched)[:20],
                 "first_20_missing": list(missing)[:20],
             },
+
             "metadata_received": {
                 "age": age,
                 "gender": gender,
@@ -778,18 +807,6 @@ def predict():
     except Exception as e:
         print("ERROR:", e, flush=True)
         return jsonify({"error": str(e)}), 500
-
-
-@app.route("/reset", methods=["POST", "GET"])
-def reset_prediction_history():
-    global prediction_history
-
-    prediction_history = []
-
-    return jsonify({
-        "status": "reset done",
-        "prediction_history": prediction_history
-    })
 
 
 if __name__ == "__main__":
