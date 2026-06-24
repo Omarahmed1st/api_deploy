@@ -17,12 +17,6 @@ app = Flask(__name__)
 
 FS = 100
 
-WINDOW_SIZE_SEC = 6
-STEP_SIZE_SEC = 0.5
-
-WINDOW_SIZE = int(WINDOW_SIZE_SEC * FS)
-STEP_SIZE = int(STEP_SIZE_SEC * FS)
-
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 
@@ -53,7 +47,7 @@ MAX_HISTORY = 5
 def home():
     return jsonify({
         "status": "API RUNNING",
-        "model_type": "ppg_only_model",
+        "model_type": "ppg_only_window_level_model",
         "features": len(features_order),
         "smoothing": USE_SMOOTHING,
         "metadata_used_by_model": False
@@ -579,110 +573,6 @@ def extract_window_features(ir, red):
 
 
 # =========================
-# PATIENT-LEVEL AGGREGATION
-# =========================
-
-def create_windows(ir, red):
-    ir = np.array(ir, dtype=np.float64)
-    red = np.array(red, dtype=np.float64)
-
-    min_len = min(len(ir), len(red))
-    ir = ir[:min_len]
-    red = red[:min_len]
-
-    windows = []
-
-    if min_len < WINDOW_SIZE:
-        windows.append((ir, red))
-        return windows
-
-    for start in range(0, min_len - WINDOW_SIZE + 1, STEP_SIZE):
-        end = start + WINDOW_SIZE
-        windows.append((ir[start:end], red[start:end]))
-
-    if len(windows) == 0:
-        windows.append((ir, red))
-
-    return windows
-
-
-def iqr_func(values):
-    values = np.array(values, dtype=np.float64)
-
-    if len(values) == 0:
-        return 0
-
-    return float(np.percentile(values, 75) - np.percentile(values, 25))
-
-
-def aggregate_patient_level(window_feature_rows):
-    window_df = pd.DataFrame(window_feature_rows)
-    window_df = window_df.replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    patient_features = {}
-
-    for col in window_df.columns:
-        values = pd.to_numeric(window_df[col], errors="coerce")
-        values = values.replace([np.inf, -np.inf], np.nan).fillna(0).values
-
-        patient_features[f"{col}_mean"] = float(np.mean(values))
-        patient_features[f"{col}_std"] = float(np.std(values))
-        patient_features[f"{col}_median"] = float(np.median(values))
-        patient_features[f"{col}_min"] = float(np.min(values))
-        patient_features[f"{col}_max"] = float(np.max(values))
-        patient_features[f"{col}_iqr_func"] = iqr_func(values)
-
-    patient_features["num_windows"] = len(window_feature_rows)
-
-    return patient_features
-
-
-def build_patient_features(ir, red):
-    windows = create_windows(ir, red)
-
-    rows = []
-
-    for ir_w, red_w in windows:
-        rows.append(extract_window_features(ir_w, red_w))
-
-    return aggregate_patient_level(rows)
-
-
-# =========================
-# QUALITY DEFAULTS
-# =========================
-
-def add_quality_defaults(features):
-    quality_cols = [
-        "quality_global_mean_abs_z",
-        "quality_global_max_abs_z",
-        "quality_ir_mean_abs_z",
-        "quality_red_mean_abs_z",
-        "quality_relation_mean_abs_z",
-        "quality_rr_instability_z",
-        "quality_frequency_instability_z",
-        "quality_amplitude_instability_z",
-        "quality_variability_instability_z",
-        "quality_rr_max_abs_z",
-        "quality_frequency_max_abs_z",
-        "quality_amplitude_max_abs_z",
-        "quality_variability_max_abs_z",
-        "quality_flag_global_outlier",
-        "quality_flag_extreme_outlier",
-        "quality_flag_rr_unstable",
-        "quality_flag_frequency_unstable",
-        "quality_flag_amplitude_unstable",
-        "quality_flag_variability_unstable",
-    ]
-
-    for col in quality_cols:
-        if col not in features:
-            features[col] = 0.0
-
-    return features
-
-
-# =========================
 # OUTPUT HELPERS
 # =========================
 
@@ -699,7 +589,7 @@ def classify_glucose_range(glucose):
         return "Very High"
 
 
-def get_confidence_and_warning(predicted_glucose):
+def get_confidence_and_warning():
     return (
         "medium",
         "Experimental non-invasive estimate. Not a replacement for glucometer."
@@ -730,7 +620,7 @@ def predict():
         if len(ir) != len(red):
             return jsonify({"error": "ir and red length mismatch"}), 400
 
-        # Metadata is received only for logging/app display.
+        # Metadata received for logging only.
         # It is NOT used by the PPG-only model.
         age = float(data.get("age", 25))
         gender = float(data.get("gender", 0))
@@ -765,18 +655,31 @@ def predict():
 
         print("VALID SIGNAL:", reason, flush=True)
 
-        # Build PPG-only features
-        features = build_patient_features(ir, red)
-
-        # Add quality defaults only if the model expects any of them.
-        features = add_quality_defaults(features)
+        # IMPORTANT:
+        # Use window-level features because the PPG-only model was trained
+        # on normal feature names like ir_mean, ir_std, red_mean, etc.
+        features = extract_window_features(ir, red)
 
         X = pd.DataFrame([features])
 
-        # Important:
-        # This line guarantees the model uses ONLY the columns it was trained on.
-        # If age/gender/diabetic/etc are not in model_features_ppg_only.pkl,
-        # they will never affect the prediction.
+        # Debug feature matching
+        api_features = set(X.columns)
+        model_features = set(features_order)
+
+        matched = api_features.intersection(model_features)
+        missing = model_features - api_features
+        extra = api_features - model_features
+
+        print("API FEATURES:", len(api_features), flush=True)
+        print("MODEL FEATURES:", len(model_features), flush=True)
+        print("MATCHED FEATURES:", len(matched), flush=True)
+        print("MISSING FEATURES:", len(missing), flush=True)
+        print("EXTRA FEATURES:", len(extra), flush=True)
+        print("FIRST 20 MATCHED:", list(matched)[:20], flush=True)
+        print("FIRST 20 MISSING:", list(missing)[:20], flush=True)
+
+        # This guarantees the model uses only the columns it was trained on.
+        # Metadata like age/gender/diabetic is not present here, so it cannot affect prediction.
         X = X.reindex(columns=features_order, fill_value=0)
 
         X = X.replace([np.inf, -np.inf], 0)
@@ -785,25 +688,25 @@ def predict():
         raw_model_pred = float(model.predict(X)[0])
 
         # Conservative clipping only
-        final_input_pred = max(50, min(raw_model_pred, 450))
+        clipped_pred = max(50, min(raw_model_pred, 450))
 
         global prediction_history
 
         if USE_SMOOTHING:
-            prediction_history.append(final_input_pred)
+            prediction_history.append(clipped_pred)
 
             if len(prediction_history) > MAX_HISTORY:
                 prediction_history.pop(0)
 
             final_pred = float(np.mean(prediction_history))
         else:
-            final_pred = final_input_pred
-            prediction_history = [final_input_pred]
+            final_pred = clipped_pred
+            prediction_history = [clipped_pred]
 
         glucose_range = classify_glucose_range(final_pred)
-        confidence, warning = get_confidence_and_warning(final_pred)
+        confidence, warning = get_confidence_and_warning()
 
-        print("MODEL USED: ppg_only_model", flush=True)
+        print("MODEL USED: ppg_only_window_level_model", flush=True)
         print("RAW MODEL PREDICTED:", raw_model_pred, flush=True)
         print("FINAL PREDICTED:", final_pred, flush=True)
         print("RANGE:", glucose_range, flush=True)
@@ -815,12 +718,20 @@ def predict():
             "glucose_range": glucose_range,
             "confidence": confidence,
             "warning": warning,
-            "model_used": "ppg_only_model",
+            "model_used": "ppg_only_window_level_model",
             "metadata_used_by_model": False,
-            "num_windows": int(features.get("num_windows", 1)),
             "smoothing_used": USE_SMOOTHING,
             "signal_status": reason,
             "used_features": len(features_order),
+            "feature_debug": {
+                "api_features": len(api_features),
+                "model_features": len(model_features),
+                "matched_features": len(matched),
+                "missing_features": len(missing),
+                "extra_features": len(extra),
+                "first_20_matched": list(matched)[:20],
+                "first_20_missing": list(missing)[:20],
+            },
             "metadata_received": {
                 "age": age,
                 "gender": gender,
