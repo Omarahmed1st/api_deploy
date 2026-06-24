@@ -22,13 +22,13 @@ MODELS_DIR = BASE_DIR / "models"
 
 
 # =========================
-# LOAD PPG-ONLY MODEL
+# LOAD FINAL PPG-ONLY MODEL
 # =========================
 
 model = joblib.load(MODELS_DIR / "glucose_model_ppg_only.pkl")
 features_order = joblib.load(MODELS_DIR / "model_features_ppg_only.pkl")
 
-print("PPG-ONLY MODEL LOADED SUCCESSFULLY", flush=True)
+print("FINAL PPG-ONLY MODEL LOADED SUCCESSFULLY", flush=True)
 print("Model file:", MODELS_DIR / "glucose_model_ppg_only.pkl", flush=True)
 print("Features file:", MODELS_DIR / "model_features_ppg_only.pkl", flush=True)
 print("Number of model features:", len(features_order), flush=True)
@@ -54,15 +54,17 @@ WARMUP_READINGS = 2
 def home():
     return jsonify({
         "status": "API RUNNING",
-        "model_type": "ppg_only_window_level_model_stable",
+        "model_type": "final_ppg_only_v4_window_level_model",
         "model_file": "glucose_model_ppg_only.pkl",
         "features_file": "model_features_ppg_only.pkl",
         "features": len(features_order),
         "smoothing": USE_SMOOTHING,
         "max_history": MAX_HISTORY,
         "outlier_threshold": OUTLIER_THRESHOLD,
+        "warmup_readings": WARMUP_READINGS,
         "metadata_used_by_model": False,
-        "diabetic_used_by_model": False
+        "diabetic_used_by_model": False,
+        "note": "Final model uses 91 PPG-only features. Metadata is logged only."
     })
 
 
@@ -79,7 +81,7 @@ def reset_prediction_history():
 
 
 # =========================
-# HELPERS
+# BASIC HELPERS
 # =========================
 
 def safe_div(a, b):
@@ -668,8 +670,8 @@ def predict():
         if len(ir) != len(red):
             return jsonify({"error": "ir and red length mismatch"}), 400
 
-        # Metadata is received only for logging and future personalization.
-        # It is NOT used by the final PPG-only model.
+        # Metadata received only for logging/future personalization.
+        # Final deployed model does NOT use metadata.
         age = float(data.get("age", 25))
         gender = float(data.get("gender", 0))
         diabetic = int(data.get("diabetic", 0))
@@ -701,7 +703,9 @@ def predict():
                 "reason": reason,
                 "display_ready": False,
                 "metadata_used_by_model": False,
-                "diabetic_used_by_model": False
+                "diabetic_used_by_model": False,
+                "model_file": "glucose_model_ppg_only.pkl",
+                "features_file": "model_features_ppg_only.pkl"
             }), 422
 
         print("VALID SIGNAL:", reason, flush=True)
@@ -725,10 +729,17 @@ def predict():
         print("FIRST 20 MATCHED:", list(matched)[:20], flush=True)
         print("FIRST 20 MISSING:", list(missing)[:20], flush=True)
 
+        if len(missing) > 0:
+            print("WARNING: Some model features are missing from API extraction", flush=True)
+
+        if len(extra) > 0:
+            print("NOTE: API produced extra features not used by model", flush=True)
+
         X = X.reindex(columns=features_order, fill_value=0)
 
         X = X.replace([np.inf, -np.inf], 0)
         X = X.fillna(0)
+        X = X.astype(float)
 
         raw_model_pred = float(model.predict(X)[0])
 
@@ -743,7 +754,7 @@ def predict():
         glucose_range = classify_glucose_range(final_pred)
         confidence, warning = get_confidence_and_warning(display_ready)
 
-        print("MODEL USED: ppg_only_window_level_model_stable", flush=True)
+        print("MODEL USED: final_ppg_only_v4_window_level_model", flush=True)
         print("MODEL FILE: glucose_model_ppg_only.pkl", flush=True)
         print("FEATURES FILE: model_features_ppg_only.pkl", flush=True)
         print("RAW MODEL PREDICTED:", raw_model_pred, flush=True)
@@ -764,7 +775,7 @@ def predict():
             "confidence": confidence,
             "warning": warning,
 
-            "model_used": "ppg_only_window_level_model_stable",
+            "model_used": "final_ppg_only_v4_window_level_model",
             "model_file": "glucose_model_ppg_only.pkl",
             "features_file": "model_features_ppg_only.pkl",
 
@@ -792,6 +803,7 @@ def predict():
                 "extra_features": len(extra),
                 "first_20_matched": list(matched)[:20],
                 "first_20_missing": list(missing)[:20],
+                "first_20_extra": list(extra)[:20],
             },
 
             "metadata_received": {
