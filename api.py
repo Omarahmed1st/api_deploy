@@ -40,12 +40,14 @@ print("Models dir:", MODELS_DIR, flush=True)
 USE_SMOOTHING = True
 
 prediction_history = []
-MAX_HISTORY = 5
 
-# لو القراءة الجديدة بعيدة أكتر من كده عن آخر median، نعتبرها outlier
+# آخر 3 قراءات فقط عشان القراءة تستجيب أسرع
+MAX_HISTORY = 3
+
+# لو قراءة نطت أكتر من كده عن آخر median نرفضها
 OUTLIER_THRESHOLD = 40.0
 
-# أول كام قراءة تعتبر warm-up
+# أول قراءتين warm-up
 WARMUP_READINGS = 2
 
 
@@ -213,43 +215,21 @@ def is_valid_ppg_signal(ir, red):
     if not np.isfinite(corr):
         return False, "Invalid IR/RED correlation"
 
-    # شرط أقوى: correlation ضعيف جدًا يترفض حتى لو فيه peaks
     if corr < 0.50:
         return False, "IR/RED correlation too weak"
 
-    strong_contact = (
-        ir_mean >= 18000 and
-        red_mean >= 12000 and
-        0.65 <= red_ir_ratio <= 0.95
-    )
-
-    pulse_match_ok = (
-        ir_bpm is not None and
-        red_bpm is not None and
-        abs(ir_bpm - red_bpm) <= 20 and
-        ir_peaks >= 3 and
-        red_peaks >= 3
-    )
-
-    has_pulse_evidence = (
-        ir_bpm is not None and
-        red_bpm is not None and
-        abs(ir_bpm - red_bpm) <= 35 and
-        ir_peaks >= 3 and
-        red_peaks >= 3
-    )
-
-    if corr < 0.60 and not pulse_match_ok:
+    if corr < 0.60:
         return False, "IR/RED signals are not correlated enough"
 
-    if (ir_std < 80 or red_std < 35) and not (strong_contact and has_pulse_evidence):
-        return False, "Signal amplitude too weak for finger contact"
+    # Stronger signal thresholds
+    if ir_range < 250 or red_range < 120:
+        return False, "Signal range too weak for reliable prediction"
 
-    if (ir_range < 250 or red_range < 100) and not (strong_contact and has_pulse_evidence):
-        return False, "Signal range too weak for finger contact"
+    if ir_cv < 0.002 or red_cv < 0.0015:
+        return False, "PPG variation too weak for reliable prediction"
 
-    if (ir_cv < 0.002 or red_cv < 0.001) and not (strong_contact and has_pulse_evidence):
-        return False, "PPG variation too weak"
+    if ir_std < 80 or red_std < 35:
+        return False, "Signal amplitude too weak for reliable prediction"
 
     if ir_mean > 400000 or red_mean > 400000:
         return False, "Signal saturated"
@@ -678,7 +658,7 @@ def predict():
         if len(ir) != len(red):
             return jsonify({"error": "ir and red length mismatch"}), 400
 
-        # Metadata received for logging only.
+        # Metadata received only for logging.
         # It is NOT used by the PPG-only model.
         age = float(data.get("age", 25))
         gender = float(data.get("gender", 0))
@@ -739,7 +719,6 @@ def predict():
 
         raw_model_pred = float(model.predict(X)[0])
 
-        # Conservative clipping
         clipped_pred = max(50, min(raw_model_pred, 450))
 
         final_pred, outlier_rejected, outlier_reason = stabilize_prediction(
